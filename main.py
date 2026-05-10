@@ -1007,8 +1007,8 @@ Position ouverte:
         # Appel API Claude
         import urllib.request
         payload = json.dumps({
-            'model': 'claude-sonnet-4-20250514',
-            'max_tokens': 300,
+            'model': 'claude-sonnet-4-6',
+            'max_tokens': 400,
             'system': context,
             'messages': [{'role': 'user', 'content': question}]
         }).encode()
