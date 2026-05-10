@@ -1,539 +1,456 @@
 """
-Portal David — Bitget Futures Bot v2
-Système adaptatif intelligent — TP/SL dynamiques, trailing stop, gestion capital progressive
-Objectif: 94 USDT → 100,000 USDT
+Portal David — Bitget Futures Bot v3
+TP/SL fiables, levier x15-20, vise 3-8% de move = 45-160% sur marge
 """
 import os, time, hmac, hashlib, base64, json, math, logging
 from datetime import datetime, timezone
 import requests
-from flask import Flask, jsonify, Response
+from flask import Flask, Response
 from threading import Thread
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-log = logging.getLogger('PortalDavid')
+log = logging.getLogger('PD')
 
-# ── CONFIG ────────────────────────────────────────────────────────────
+# ══ CONFIG ════════════════════════════════════════════════════════════
 API_KEY    = os.environ.get('BITGET_API_KEY', '')
 SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', '')
 PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', '')
-BASE_URL   = 'https://api.bitget.com'
+BASE       = 'https://api.bitget.com'
 
-# ── RISK ENGINE — tout est dynamique ─────────────────────────────────
-# Capital par tranche — le bot adapte sa stratégie
-CAPITAL_TIERS = [
-    # (max_capital, risk_pct, max_leverage, label)
-    (200,    0.95, 10, 'Micro'),      # 94–200$   : agressif
-    (500,    0.95, 15, 'Petit'),      # 200–500$  : très agressif
-    (2000,   0.95, 20, 'Moyen'),      # 500–2k$   : maximum
-    (10000,  0.95, 25, 'Croissance'), # 2k–10k$   : institutionnel
-    (50000,  0.95, 25, 'Grand'),      # 10k–50k$  : élite
-    (999999, 0.95, 25, 'Élite'),      # 50k+$     : élite
-]
+LEVERAGE      = 15       # levier fixe — monte à 20 si capital > 500$
+RISK_PCT      = 0.90     # 90% du capital par trade
+TP_PCT        = 0.05     # take profit +5% du prix → +75% sur marge à x15
+SL_PCT        = 0.025    # stop loss -2.5% → -37% sur marge (jamais liquidé)
+MIN_SCORE     = 62       # score minimum pour entrer
+SCAN_SEC      = 50       # scan toutes les 50 secondes
+MIN_VOL_24H   = 8_000_000  # volume minimum USDT
 
-# TP/SL dynamiques selon la conviction (score)
-# Format: (score_min, tp_pct, sl_pct, label)
-CONVICTION_TIERS = [
-    (85, 0.15, 0.05, 'Extrême'),   # score 85+  → TP 15%, SL 5%
-    (75, 0.10, 0.04, 'Forte'),     # score 75+  → TP 10%, SL 4%
-    (65, 0.07, 0.03, 'Bonne'),     # score 65+  → TP 7%,  SL 3%
-    (55, 0.05, 0.025,'Modérée'),   # score 55+  → TP 5%,  SL 2.5% (partiel seulement)
-]
+STATE_FILE = '/tmp/pdv3.json'
 
-SCAN_INTERVAL   = 45   # secondes
-MIN_SCORE_ENTRY = 60   # score minimum pour entrer
-MIN_VOLUME_24H  = 10_000_000  # volume min USDT
-TRAILING_ACTIVE_AT = 0.03  # activer trailing après +3% de gain
-TRAILING_DISTANCE  = 0.015 # trailing à 1.5% du plus haut
-
-# ── STATE FILE ────────────────────────────────────────────────────────
-STATE_FILE = '/tmp/state.json'
+# ══ STATE ══════════════════════════════════════════════════════════════
+def empty_state():
+    return {
+        'status':            'Démarrage…',
+        'balance':           0.0,
+        'balance_total':     0.0,
+        'initial_balance':   94.36,
+        'position':          None,
+        'history':           [],
+        'total_pnl':         0.0,
+        'today_pnl':         0.0,
+        'today_date':        str(datetime.now(timezone.utc).date()),
+        'signals_checked':   0,
+        'total_trades':      0,
+        'win_trades':        0,
+        'consecutive_wins':  0,
+        'consecutive_losses':0,
+        'mode':              'Normal',
+        'last_scan':         None,
+        'score_weights':     {
+            'rsi': 1.0, 'macd': 1.0, 'volume': 1.0,
+            'breakout': 1.0, 'range': 1.0, 'funding': 1.0
+        }
+    }
 
 def load_state():
     try:
         with open(STATE_FILE) as f:
-            return json.load(f)
+            s = json.load(f)
+            # Assurer que tous les champs existent
+            base = empty_state()
+            base.update(s)
+            return base
     except:
-        return {
-            'status': 'Démarrage…',
-            'balance': 0,
-            'peak_balance': 94.36,
-            'position': None,
-            'history': [],
-            'total_pnl': 0,
-            'today_pnl': 0,
-            'today_date': str(datetime.now(timezone.utc).date()),
-            'last_scan': None,
-            'signals_checked': 0,
-            'consecutive_wins': 0,
-            'consecutive_losses': 0,
-            'total_trades': 0,
-            'win_trades': 0,
-            'tier': 'Micro',
-            'mode': 'Normal',  # Normal, Aggressive, Protective
-        }
+        return empty_state()
 
 def save_state(s):
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump(s, f, indent=2, default=str)
+            json.dump(s, f, default=str)
     except Exception as e:
-        log.error(f'Save state error: {e}')
+        log.error(f'Save: {e}')
 
-STATE = load_state()
+S = load_state()
 
-# ── CAPITAL ENGINE ────────────────────────────────────────────────────
-def get_capital_config(balance, state):
-    for max_cap, risk, max_lev, label in CAPITAL_TIERS:
-        if balance <= max_cap:
-            # Ajuster selon la série
-            mode = state.get('mode', 'Normal')
-            if mode == 'Aggressive':
-                risk = min(risk * 1.3, 0.12)
-                max_lev = min(max_lev + 3, 30)
-            elif mode == 'Protective':
-                risk = risk * 0.5
-                max_lev = max(max_lev - 3, 3)
-            return {'risk': risk, 'max_leverage': max_lev, 'label': label}
-    return {'risk': 0.05, 'max_leverage': 25, 'label': 'Élite'}
-
-def get_conviction_config(score):
-    for min_score, tp, sl, label in CONVICTION_TIERS:
-        if score >= min_score:
-            return {'tp': tp, 'sl': sl, 'label': label}
-    return {'tp': 0.05, 'sl': 0.025, 'label': 'Faible'}
-
-def update_mode(state):
-    wins  = state.get('consecutive_wins', 0)
-    losses= state.get('consecutive_losses', 0)
-    if losses >= 2:
-        state['mode'] = 'Protective'
-        log.info('Mode: Protective (2 pertes consécutives)')
-    elif wins >= 3:
-        state['mode'] = 'Aggressive'
-        log.info('Mode: Aggressive (3 gains consécutifs)')
-    else:
-        state['mode'] = 'Normal'
-    return state
-
-# ── BITGET API ────────────────────────────────────────────────────────
-def sign(ts, method, path, body=''):
+# ══ BITGET API ══════════════════════════════════════════════════════════
+def _sign(ts, method, path, body=''):
     msg = f'{ts}{method}{path}{body}'
-    sig = hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256).digest()
-    return base64.b64encode(sig).decode()
+    return base64.b64encode(
+        hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256).digest()
+    ).decode()
 
-def make_headers(method, path, body=''):
+def _hdrs(method, path, body=''):
     ts = str(int(time.time() * 1000))
     return {
         'ACCESS-KEY':        API_KEY,
-        'ACCESS-SIGN':       sign(ts, method, path, body),
+        'ACCESS-SIGN':       _sign(ts, method, path, body),
         'ACCESS-TIMESTAMP':  ts,
         'ACCESS-PASSPHRASE': PASSPHRASE,
         'Content-Type':      'application/json',
         'locale':            'en-US',
     }
 
-def api_get(path, params=None):
-    qs = ('?' + '&'.join(f'{k}={v}' for k, v in params.items())) if params else ''
+def GET(path, params=None):
+    qs = ('?' + '&'.join(f'{k}={v}' for k,v in params.items())) if params else ''
     try:
-        r = requests.get(BASE_URL + path + qs, headers=make_headers('GET', path + qs), timeout=10)
+        r = requests.get(BASE + path + qs, headers=_hdrs('GET', path + qs), timeout=12)
         return r.json()
     except Exception as e:
         log.error(f'GET {path}: {e}')
         return {}
 
-def api_post(path, body):
+def POST(path, body):
     b = json.dumps(body)
     try:
-        r = requests.post(BASE_URL + path, headers=make_headers('POST', path, b), data=b, timeout=10)
+        r = requests.post(BASE + path, headers=_hdrs('POST', path, b), data=b, timeout=12)
         return r.json()
     except Exception as e:
         log.error(f'POST {path}: {e}')
         return {}
 
-# ── MARKET DATA ───────────────────────────────────────────────────────
+# ══ MARKET DATA ══════════════════════════════════════════════════════════
 def get_balance():
-    try:
-        r = api_get('/api/v2/mix/account/account', {'productType':'USDT-FUTURES','marginCoin':'USDT'})
-        log.info(f'Balance ep1: {str(r)[:200]}')
-        if r.get('code') == '00000' and r.get('data'):
-            d = r['data']
-            for k in ['available','availableAmount','crossedMaxAvailable']:
-                if d.get(k) is not None and float(d.get(k,0)) >= 0:
-                    log.info(f'Balance found via {k}: {d[k]}')
-                    return float(d[k])
-    except Exception as e:
-        log.error(f'Balance ep1: {e}')
-    try:
-        r = api_get('/api/v2/mix/account/accounts', {'productType':'USDT-FUTURES'})
-        log.info(f'Balance ep2: {str(r)[:200]}')
-        if r.get('code') == '00000' and r.get('data'):
-            for acc in r['data']:
-                if acc.get('marginCoin','').upper() == 'USDT':
-                    val = acc.get('available') or acc.get('availableAmount','0')
-                    return float(val)
-    except Exception as e:
-        log.error(f'Balance ep2: {e}')
-    return 0
+    # Endpoint 1
+    r = GET('/api/v2/mix/account/accounts', {'productType': 'USDT-FUTURES'})
+    if r.get('code') == '00000':
+        for acc in (r.get('data') or []):
+            if acc.get('marginCoin', '').upper() == 'USDT':
+                val = acc.get('available') or acc.get('crossedMaxAvailable') or '0'
+                v = float(val)
+                if v > 0:
+                    log.info(f'Balance: {v} USDT')
+                    return v
+    # Endpoint 2
+    r2 = GET('/api/v2/mix/account/account', {'productType': 'USDT-FUTURES', 'marginCoin': 'USDT'})
+    if r2.get('code') == '00000' and r2.get('data'):
+        val = r2['data'].get('available', '0')
+        v = float(val)
+        log.info(f'Balance ep2: {v}')
+        return v
+    log.warning(f'Balance failed: {r}')
+    return 0.0
 
 def get_positions():
-    try:
-        r = api_get('/api/v2/mix/position/all-position', {'productType':'USDT-FUTURES','marginCoin':'USDT'})
-        if r.get('code') == '00000':
-            return [p for p in r['data'] if float(p.get('total',0)) > 0]
-    except: pass
+    r = GET('/api/v2/mix/position/all-position', {
+        'productType': 'USDT-FUTURES', 'marginCoin': 'USDT'
+    })
+    if r.get('code') == '00000':
+        return [p for p in (r.get('data') or []) if float(p.get('total', 0)) > 0]
     return []
 
 def get_tickers():
-    try:
-        r = api_get('/api/v2/mix/market/tickers', {'productType':'USDT-FUTURES'})
-        if r.get('code') == '00000':
-            return r['data']
-    except: pass
+    r = GET('/api/v2/mix/market/tickers', {'productType': 'USDT-FUTURES'})
+    if r.get('code') == '00000':
+        return r.get('data', [])
     return []
 
 def get_candles(symbol, gran, limit=100):
-    try:
-        r = api_get('/api/v2/mix/market/candles', {
-            'symbol':symbol,'productType':'USDT-FUTURES',
-            'granularity':gran,'limit':str(limit)
-        })
-        if r.get('code') == '00000':
-            return r['data']
-    except: pass
+    r = GET('/api/v2/mix/market/candles', {
+        'symbol': symbol, 'productType': 'USDT-FUTURES',
+        'granularity': gran, 'limit': str(limit)
+    })
+    if r.get('code') == '00000':
+        return r.get('data', [])
     return []
 
-def get_open_interest(symbol):
+def get_funding(symbol):
+    r = GET('/api/v2/mix/market/current-fund-rate', {
+        'symbol': symbol, 'productType': 'USDT-FUTURES'
+    })
     try:
-        r = api_get('/api/v2/mix/market/open-interest', {'symbol':symbol,'productType':'USDT-FUTURES'})
-        if r.get('code') == '00000':
-            return float(r['data'].get('openInterestList',[{}])[0].get('size',0))
-    except: pass
-    return 0
+        return float(r['data'][0].get('fundingRate', 0)) * 100
+    except:
+        return 0.0
 
-def get_funding_rate(symbol):
-    try:
-        r = api_get('/api/v2/mix/market/current-fund-rate', {'symbol':symbol,'productType':'USDT-FUTURES'})
-        if r.get('code') == '00000':
-            return float(r['data'][0].get('fundingRate',0)) * 100
-    except: pass
-    return 0
-
-def get_contract_info(symbol):
-    try:
-        r = api_get('/api/v2/mix/market/contracts', {'productType':'USDT-FUTURES','symbol':symbol})
-        if r.get('code') == '00000' and r['data']:
-            return r['data'][0]
-    except: pass
-    return None
-
-# ── INDICATORS ────────────────────────────────────────────────────────
-def calc_rsi(closes, period=14):
-    if len(closes) < period + 1: return 50
+# ══ INDICATORS ════════════════════════════════════════════════════════
+def rsi(closes, n=14):
+    if len(closes) < n + 1: return 50.0
     gains, losses = [], []
     for i in range(1, len(closes)):
         d = closes[i] - closes[i-1]
-        gains.append(max(d,0)); losses.append(max(-d,0))
-    ag = sum(gains[-period:]) / period
-    al = sum(losses[-period:]) / period
-    if al == 0: return 100
-    return 100 - (100 / (1 + ag/al))
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag = sum(gains[-n:]) / n
+    al = sum(losses[-n:]) / n
+    if al == 0: return 100.0
+    return 100.0 - (100.0 / (1 + ag / al))
 
-def calc_ema(data, n):
+def ema(data, n):
     if not data: return []
-    k = 2/(n+1)
+    k = 2 / (n + 1)
     e = [data[0]]
-    for v in data[1:]: e.append(v*k + e[-1]*(1-k))
+    for v in data[1:]:
+        e.append(v * k + e[-1] * (1 - k))
     return e
 
-def calc_macd(closes):
-    if len(closes) < 35: return 0, 0, 0
-    fast = calc_ema(closes, 12)
-    slow = calc_ema(closes, 26)
-    macd = [f-s for f,s in zip(fast,slow)]
-    sig  = calc_ema(macd, 9)
-    hist = macd[-1] - sig[-1]
-    return macd[-1], sig[-1], hist
+def macd_hist(closes):
+    if len(closes) < 35: return 0.0
+    fast = ema(closes, 12)
+    slow = ema(closes, 26)
+    ml   = [f - s for f, s in zip(fast, slow)]
+    sig  = ema(ml, 9)
+    return ml[-1] - sig[-1]
 
-def calc_atr(candles, period=14):
-    """Average True Range — mesure la volatilité réelle"""
-    if len(candles) < period + 1: return 0
+def atr(candles, n=14):
+    if len(candles) < n + 1: return 0.0
     trs = []
     for i in range(1, len(candles)):
-        h = float(candles[i][2])
-        l = float(candles[i][3])
-        pc= float(candles[i-1][4])
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-    return sum(trs[-period:]) / period
+        h  = float(candles[i][2])
+        l  = float(candles[i][3])
+        pc = float(candles[i-1][4])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-n:]) / n
 
-def calc_bollinger(closes, period=20, std_dev=2):
-    if len(closes) < period: return 0, 0, 0
-    recent = closes[-period:]
-    mid = sum(recent) / period
-    variance = sum((x-mid)**2 for x in recent) / period
-    std = variance ** 0.5
-    return mid + std_dev*std, mid, mid - std_dev*std
-
-def detect_volume_spike(candles, lookback=20):
-    if len(candles) < lookback+1: return 1.0
+def vol_spike(candles, n=20):
+    if len(candles) < n + 1: return 1.0
     vols = [float(c[5]) for c in candles]
-    avg  = sum(vols[-lookback-1:-1]) / lookback
-    last = vols[-1]
-    return last / avg if avg > 0 else 1.0
+    avg  = sum(vols[-n-1:-1]) / n
+    return vols[-1] / avg if avg > 0 else 1.0
 
-def detect_breakout(closes, candles):
-    """Détecte si le prix sort d'une consolidation"""
-    if len(closes) < 30: return False, 0
-    recent_high = max(closes[-20:-1])
-    recent_low  = min(closes[-20:-1])
-    current     = closes[-1]
-    range_pct   = (recent_high - recent_low) / recent_low * 100
-
-    # Breakout haussier
-    if current > recent_high * 1.002 and range_pct < 8:
-        return True, 1  # breakout long
-    # Breakout baissier
-    if current < recent_low * 0.998 and range_pct < 8:
-        return True, -1  # breakout short
-    return False, 0
-
-# ── SCORING ENGINE ────────────────────────────────────────────────────
-def score_symbol(ticker, c1m, c5m, c15m, c1h):
-    score   = 0
-    direction = 'long'
-    reasons = []
-    bonus_signals = []
-
+# ══ SCORING ════════════════════════════════════════════════════════════
+def score_token(ticker, c1m, c5m, c15m, c1h, weights):
     try:
-        sym   = ticker.get('symbol','')
-        price = float(ticker.get('lastPr', 0))
-        vol24 = float(ticker.get('usdtVolume', 0))
-        chg24 = float(ticker.get('change24h', 0)) * 100
-        high24= float(ticker.get('high24h', price))
-        low24 = float(ticker.get('low24h', price))
+        price  = float(ticker.get('lastPr', 0))
+        vol24  = float(ticker.get('usdtVolume', 0))
+        chg24  = float(ticker.get('change24h', 0)) * 100
+        high24 = float(ticker.get('high24h', price))
+        low24  = float(ticker.get('low24h', price))
 
-        if price <= 0 or vol24 < MIN_VOLUME_24H: return None
+        if price <= 0 or vol24 < MIN_VOL_24H:
+            return None
 
-        # Extraire les closes de chaque TF
-        def closes(candles): return [float(c[4]) for c in candles] if candles else []
-        cl1m  = closes(c1m)
-        cl5m  = closes(c5m)
-        cl15m = closes(c15m)
-        cl1h  = closes(c1h)
+        def cl(c): return [float(x[4]) for x in c] if c else []
+        cl1m  = cl(c1m);  cl5m = cl(c5m)
+        cl15m = cl(c15m); cl1h = cl(c1h)
 
-        # ── 1. RSI MULTI-TF (0-25pts) ──
-        rsi1m  = calc_rsi(cl1m)  if len(cl1m)  > 15 else 50
-        rsi5m  = calc_rsi(cl5m)  if len(cl5m)  > 15 else 50
-        rsi15m = calc_rsi(cl15m) if len(cl15m) > 15 else 50
-        rsi1h  = calc_rsi(cl1h)  if len(cl1h)  > 15 else 50
+        score = 0
+        direction = 'long'
+        reasons = []
 
-        # Survendu = opportunité long
-        if rsi1m < 30 and rsi5m < 35:
-            score += 25; direction = 'long'
-            reasons.append(f'RSI survendu 1m:{rsi1m:.0f} 5m:{rsi5m:.0f}')
-        elif rsi1m < 35 and rsi5m < 40:
-            score += 18; direction = 'long'
-            reasons.append(f'RSI bas 1m:{rsi1m:.0f}')
-        # Surchauffé = opportunité short
-        elif rsi1m > 75 and rsi5m > 70:
-            score += 25; direction = 'short'
-            reasons.append(f'RSI surachat 1m:{rsi1m:.0f}')
-        elif rsi1m > 70 and rsi5m > 65:
-            score += 18; direction = 'short'
-            reasons.append(f'RSI élevé 1m:{rsi1m:.0f}')
-        elif 42 <= rsi5m <= 58:
-            score += 8
+        # ── RSI ──────────────────────────────────── w=1.0
+        w_rsi = weights.get('rsi', 1.0)
+        r1m  = rsi(cl1m)
+        r5m  = rsi(cl5m)
+        r15m = rsi(cl15m)
 
-        # Alignement multi-TF
-        if direction == 'long'  and rsi15m < 45 and rsi1h < 50:
-            score += 10; reasons.append('RSI aligné multi-TF haussier')
-        elif direction == 'short' and rsi15m > 55 and rsi1h > 50:
-            score += 10; reasons.append('RSI aligné multi-TF baissier')
+        if r1m < 28 and r5m < 32:
+            score += 28 * w_rsi; direction = 'long'
+            reasons.append(f'RSI très survendu 1m:{r1m:.0f} 5m:{r5m:.0f}')
+        elif r1m < 35 and r5m < 40:
+            score += 18 * w_rsi; direction = 'long'
+            reasons.append(f'RSI survendu 1m:{r1m:.0f}')
+        elif r1m > 72 and r5m > 68:
+            score += 28 * w_rsi; direction = 'short'
+            reasons.append(f'RSI surachat 1m:{r1m:.0f} 5m:{r5m:.0f}')
+        elif r1m > 65 and r5m > 62:
+            score += 18 * w_rsi; direction = 'short'
+            reasons.append(f'RSI surachat 1m:{r1m:.0f}')
+        elif 42 <= r5m <= 58:
+            score += 8 * w_rsi
 
-        # ── 2. MACD (0-20pts) ──
-        _, _, hist5m = calc_macd(cl5m)
-        _, _, hist15m= calc_macd(cl15m)
+        # Alignement 15m
+        if direction == 'long'  and r15m < 48: score += 8 * w_rsi
+        elif direction == 'short' and r15m > 52: score += 8 * w_rsi
+
+        # ── MACD ─────────────────────────────────── w=1.0
+        w_macd = weights.get('macd', 1.0)
+        mh5m  = macd_hist(cl5m)
+        mh15m = macd_hist(cl15m)
         if direction == 'long':
-            if hist5m > 0 and hist15m > 0:
-                score += 20; reasons.append('MACD haussier 5m+15m')
-            elif hist5m > 0:
-                score += 12
+            if mh5m > 0 and mh15m > 0:
+                score += 20 * w_macd
+                reasons.append('MACD haussier aligné 5m+15m')
+            elif mh5m > 0: score += 10 * w_macd
         else:
-            if hist5m < 0 and hist15m < 0:
-                score += 20; reasons.append('MACD baissier 5m+15m')
-            elif hist5m < 0:
-                score += 12
+            if mh5m < 0 and mh15m < 0:
+                score += 20 * w_macd
+                reasons.append('MACD baissier aligné 5m+15m')
+            elif mh5m < 0: score += 10 * w_macd
 
-        # ── 3. BREAKOUT DETECTION (0-20pts) ──
-        is_breakout, bo_dir = detect_breakout(cl15m, c15m)
-        if is_breakout:
-            if bo_dir == 1 and direction == 'long':
-                score += 20
-                reasons.append('BREAKOUT haussier détecté')
-                bonus_signals.append('BREAKOUT')
-            elif bo_dir == -1 and direction == 'short':
-                score += 20
-                reasons.append('BREAKOUT baissier détecté')
-                bonus_signals.append('BREAKOUT')
+        # ── VOLUME SPIKE ─────────────────────────── w=1.0
+        w_vol = weights.get('volume', 1.0)
+        vs = vol_spike(c5m)
+        if vs > 5:
+            score += 18 * w_vol
+            reasons.append(f'Volume x{vs:.1f} — activité massive')
+        elif vs > 3: score += 12 * w_vol; reasons.append(f'Volume x{vs:.1f}')
+        elif vs > 2: score += 7 * w_vol
+        elif vs < 0.5: score -= 8
 
-        # ── 4. VOLUME SPIKE (0-15pts) ──
-        vol_spike = detect_volume_spike(c5m)
-        if vol_spike > 5:
-            score += 15
-            reasons.append(f'Volume x{vol_spike:.1f} explosif')
-            bonus_signals.append(f'VOL x{vol_spike:.0f}')
-        elif vol_spike > 3:
-            score += 10
-            reasons.append(f'Volume x{vol_spike:.1f}')
-        elif vol_spike > 2:
-            score += 6
-        elif vol_spike < 0.5:
-            score -= 8
+        # ── BREAKOUT ─────────────────────────────── w=1.0
+        w_bo = weights.get('breakout', 1.0)
+        if len(cl15m) >= 20:
+            rec_hi = max(cl15m[-20:-1])
+            rec_lo = min(cl15m[-20:-1])
+            rng    = (rec_hi - rec_lo) / rec_lo * 100
+            cur    = cl15m[-1]
+            if cur > rec_hi * 1.002 and rng < 8 and direction == 'long':
+                score += 20 * w_bo
+                reasons.append('Breakout haussier confirmé')
+            elif cur < rec_lo * 0.998 and rng < 8 and direction == 'short':
+                score += 20 * w_bo
+                reasons.append('Breakout baissier confirmé')
 
-        # ── 5. BOLLINGER BANDS (0-15pts) ──
-        if len(cl1h) >= 20:
-            bb_up, bb_mid, bb_low = calc_bollinger(cl1h)
-            if direction == 'long'  and price < bb_low * 1.002:
-                score += 15; reasons.append('Prix sous bande Bollinger basse')
-                bonus_signals.append('BB OVERSOLD')
-            elif direction == 'short' and price > bb_up * 0.998:
-                score += 15; reasons.append('Prix au-dessus bande Bollinger haute')
-                bonus_signals.append('BB OVERBOUGHT')
-            elif bb_low < price < bb_mid and direction == 'long':
-                score += 8
-
-        # ── 6. ATR — VOLATILITÉ (bonus/malus) ──
-        atr5m = calc_atr(c5m)
-        atr_pct = (atr5m / price * 100) if price > 0 else 0
-        if 0.3 <= atr_pct <= 2.0:
-            score += 8  # volatilité idéale
-        elif atr_pct > 4:
-            score -= 10  # trop volatile = risqué
-
-        # ── 7. POSITION DANS RANGE 24H (0-10pts) ──
+        # ── RANGE 24H ────────────────────────────── w=1.0
+        w_rng = weights.get('range', 1.0)
         if high24 > low24:
-            pos_range = (price - low24) / (high24 - low24)
-            if direction == 'long'  and pos_range < 0.25:
-                score += 10; reasons.append('Prix bas du range 24h')
-            elif direction == 'short' and pos_range > 0.75:
-                score += 10; reasons.append('Prix haut du range 24h')
-            elif 0.3 <= pos_range <= 0.7:
-                score += 5
+            pos_r = (price - low24) / (high24 - low24)
+            if direction == 'long'  and pos_r < 0.25:
+                score += 12 * w_rng
+                reasons.append('Prix en bas du range journalier')
+            elif direction == 'short' and pos_r > 0.75:
+                score += 12 * w_rng
+                reasons.append('Prix en haut du range journalier')
+            elif 0.3 <= pos_r <= 0.7: score += 5 * w_rng
 
-        # ── 8. FUNDING RATE (0-10pts) ──
-        funding = get_funding_rate(sym)
-        if direction == 'long'  and funding < -0.02:
-            score += 10; reasons.append(f'Funding {funding:.3f}% — longs favorisés')
-            bonus_signals.append('FUNDING+')
-        elif direction == 'short' and funding > 0.02:
-            score += 10; reasons.append(f'Funding {funding:.3f}% — shorts favorisés')
-            bonus_signals.append('FUNDING+')
-        elif abs(funding) > 0.1:
-            score -= 15  # funding extrême = danger
+        # ── FUNDING ──────────────────────────────── w=1.0
+        w_fund = weights.get('funding', 1.0)
+        fund = get_funding(ticker.get('symbol', ''))
+        if direction == 'long'  and fund < -0.02:
+            score += 10 * w_fund
+            reasons.append(f'Funding {fund:.3f}% favorable')
+        elif direction == 'short' and fund > 0.02:
+            score += 10 * w_fund
+            reasons.append(f'Funding {fund:.3f}% favorable')
+        elif abs(fund) > 0.08: score -= 15
 
-        # ── MALUS ──
-        # Déjà trop pumpé sans volume
-        if chg24 > 25 and vol_spike < 1.5 and direction == 'long':
-            score -= 20
-        # En chute libre
-        if chg24 < -20 and direction == 'long':
-            score -= 15
+        # ── MALUS ────────────────────────────────────────────────────
+        # Déjà trop pumpé
+        if chg24 > 20 and direction == 'long':  score -= 15
+        if chg24 < -20 and direction == 'short': score -= 15
+        # ATR — volatilité
+        a = atr(c5m)
+        atr_pct = (a / price * 100) if price > 0 else 0
+        if atr_pct > 4: score -= 12  # trop volatile
 
+        final = min(100, max(0, round(score)))
+        return {
+            'score':     final,
+            'direction': direction,
+            'reasons':   reasons[:3],
+            'atr_pct':   round(atr_pct, 3),
+            'vol_spike': round(vs, 2),
+            'rsi_1m':    round(r1m, 1),
+            'rsi_5m':    round(r5m, 1),
+            'funding':   round(fund, 4),
+            'chg24':     round(chg24, 2),
+        }
     except Exception as e:
-        log.warning(f'Score error {ticker.get("symbol","?")}: {e}')
+        log.warning(f'Score error: {e}')
         return None
 
-    final_score = min(100, max(0, round(score)))
+# ══ ADAPTIVE LEARNING ═════════════════════════════════════════════════
+def update_weights(state):
+    """Ajuste les poids des indicateurs selon les performances passées"""
+    hist = state.get('history', [])
+    if len(hist) < 5:
+        return state  # pas assez de données
 
-    return {
-        'score':     final_score,
-        'direction': direction,
-        'reasons':   reasons[:4],
-        'bonus':     bonus_signals,
-        'atr_pct':   round(atr_pct, 3) if 'atr_pct' in dir() else 0,
-        'vol_spike': round(vol_spike, 2),
-        'price':     price,
-        'chg24':     chg24,
-        'vol24':     vol24,
-        'rsi5m':     round(rsi5m, 1) if 'rsi5m' in dir() else 50,
-        'funding':   round(funding, 4) if 'funding' in dir() else 0,
-    }
+    # Analyser les 10 derniers trades
+    recent = hist[:10]
+    wins   = [h for h in recent if h.get('pnl', 0) > 0]
+    losses = [h for h in recent if h.get('pnl', 0) <= 0]
 
-# ── SET LEVERAGE ──────────────────────────────────────────────────────
-def set_leverage(symbol, leverage):
-    for side in ['long','short']:
-        api_post('/api/v2/mix/account/set-leverage', {
-            'symbol':symbol,'productType':'USDT-FUTURES',
-            'marginCoin':'USDT','leverage':str(leverage),'holdSide':side
-        })
-    time.sleep(0.3)
+    if not wins and not losses:
+        return state
 
-# ── PLACE ORDER ───────────────────────────────────────────────────────
-def place_order(symbol, direction, balance, score_result, state):
+    weights = state.get('score_weights', {
+        'rsi': 1.0, 'macd': 1.0, 'volume': 1.0,
+        'breakout': 1.0, 'range': 1.0, 'funding': 1.0
+    })
+
+    # Si on perd beaucoup → réduire légèrement les poids
+    # Si on gagne → augmenter légèrement
+    win_rate = len(wins) / len(recent)
+
+    if win_rate >= 0.65:
+        # Bonne performance — légèrement plus agressif
+        for k in weights:
+            weights[k] = min(1.5, weights[k] * 1.05)
+        state['mode'] = 'Aggressive' if win_rate >= 0.8 else 'Normal'
+        log.info(f'Learning: win_rate={win_rate:.0%} → mode Aggressive')
+    elif win_rate <= 0.35:
+        # Mauvaise performance — plus conservateur
+        for k in weights:
+            weights[k] = max(0.5, weights[k] * 0.92)
+        state['mode'] = 'Protective'
+        log.info(f'Learning: win_rate={win_rate:.0%} → mode Protective')
+    else:
+        state['mode'] = 'Normal'
+
+    state['score_weights'] = weights
+    return state
+
+# ══ LEVERAGE ══════════════════════════════════════════════════════════
+def set_leverage(symbol, lev, side):
+    r = POST('/api/v2/mix/account/set-leverage', {
+        'symbol':      symbol,
+        'productType': 'USDT-FUTURES',
+        'marginCoin':  'USDT',
+        'leverage':    str(lev),
+        'holdSide':    side,
+    })
+    log.info(f'SetLev {symbol} x{lev} {side}: {r.get("code")}')
+    return r.get('code') == '00000'
+
+# ══ PLACE ORDER ═══════════════════════════════════════════════════════
+def place_order(symbol, direction, balance, scored):
     try:
-        cap_cfg  = get_capital_config(balance, state)
-        conv_cfg = get_conviction_config(score_result['score'])
-        atr_pct  = score_result.get('atr_pct', 0.5)
+        # Levier selon capital
+        lev = 20 if balance >= 500 else 15
 
-        # Levier adaptatif selon conviction ET volatilité
-        base_lev = cap_cfg['max_leverage']
-        score    = score_result['score']
-        if score >= 85:
-            leverage = base_lev
-        elif score >= 75:
-            leverage = max(int(base_lev * 0.9), 10)
-        else:
-            leverage = max(int(base_lev * 0.8), 10)
-
-        # Réduire levier si volatilité extrême seulement
-        if atr_pct > 3.0:
-            leverage = max(int(leverage * 0.75), 10)
-
-        set_leverage(symbol, leverage)
+        # Set leverage pour les deux côtés
+        set_leverage(symbol, lev, 'long')
+        time.sleep(0.2)
+        set_leverage(symbol, lev, 'short')
         time.sleep(0.3)
 
         # Prix actuel
-        tk = api_get('/api/v2/mix/market/ticker', {'symbol':symbol,'productType':'USDT-FUTURES'})
-        if tk.get('code') != '00000': return None
+        tk = GET('/api/v2/mix/market/ticker', {
+            'symbol': symbol, 'productType': 'USDT-FUTURES'
+        })
+        if tk.get('code') != '00000':
+            log.error(f'Ticker failed: {tk}')
+            return None
         price = float(tk['data'][0]['lastPr'])
+        log.info(f'Entry price: {price}')
 
-        # Taille position
-        risk_usdt = balance * 0.95  # 95% du capital total
-        pos_value = risk_usdt * leverage
-        info      = get_contract_info(symbol)
-        size_dec  = int(info.get('volumePlace',0)) if info else 1
-        min_size  = float(info.get('minTradeNum',0.001)) if info else 0.001
+        # Infos contrat
+        ci = GET('/api/v2/mix/market/contracts', {
+            'productType': 'USDT-FUTURES', 'symbol': symbol
+        })
+        size_dec = 1
+        min_size = 0.01
+        price_dec = 6
+        if ci.get('code') == '00000' and ci.get('data'):
+            d = ci['data'][0]
+            size_dec  = int(d.get('volumePlace', 1))
+            min_size  = float(d.get('minTradeNum', 0.01))
+            price_dec = int(d.get('pricePlace', 6))
 
-        size = pos_value / price
-        size = max(size, min_size)
-        size = round(size, size_dec) if size_dec > 0 else max(1, int(size))
+        # Taille position — 90% du capital × levier
+        risk  = balance * RISK_PCT
+        size  = (risk * lev) / price
+        size  = max(size, min_size)
+        size  = round(size, size_dec) if size_dec > 0 else max(1, math.floor(size))
 
-        # TP/SL dynamiques basés sur ATR + conviction
-        tp_pct = conv_cfg['tp']
-        sl_pct = conv_cfg['sl']
-
-        # Ajuster avec l'ATR — si très volatile, TP plus large
-        if atr_pct > 1.0:
-            tp_pct = tp_pct * (1 + atr_pct * 0.3)
-            sl_pct = sl_pct * (1 + atr_pct * 0.2)
-
-        # Bonus breakout — laisser courir plus loin
-        if 'BREAKOUT' in score_result.get('bonus',[]):
-            tp_pct *= 1.5
-
-        # Limiter les extremes
-        tp_pct = min(tp_pct, 0.35)
-        sl_pct = min(sl_pct, 0.08)
+        # TP et SL — prix absolus arrondis correctement
+        def rnd(p):
+            return round(p, price_dec)
 
         if direction == 'long':
-            tp_price = round(price * (1 + tp_pct), 6)
-            sl_price = round(price * (1 - sl_pct), 6)
+            tp_price = rnd(price * (1 + TP_PCT))
+            sl_price = rnd(price * (1 - SL_PCT))
+            side     = 'buy'
         else:
-            tp_price = round(price * (1 - tp_pct), 6)
-            sl_price = round(price * (1 + sl_pct), 6)
+            tp_price = rnd(price * (1 - TP_PCT))
+            sl_price = rnd(price * (1 + SL_PCT))
+            side     = 'sell'
 
-        side     = 'buy'  if direction == 'long'  else 'sell'
+        log.info(f'Order: {symbol} {side} size={size} price={price} TP={tp_price} SL={sl_price} lev=x{lev}')
 
-        order = {
+        # ÉTAPE 1 — Ordre market (sans TP/SL dans l'ordre)
+        order_body = {
             'symbol':      symbol,
             'productType': 'USDT-FUTURES',
             'marginMode':  'isolated',
@@ -542,293 +459,360 @@ def place_order(symbol, direction, balance, score_result, state):
             'side':        side,
             'tradeSide':   'open',
             'orderType':   'market',
-            'presetStopSurplusPrice': str(tp_price),
-            'presetStopLossPrice':    str(sl_price),
         }
+        r = POST('/api/v2/mix/order/place-order', order_body)
+        log.info(f'Order response: {r}')
 
-        r = api_post('/api/v2/mix/order/place-order', order)
-        log.info(f'Order: {r}')
-
-        if r.get('code') == '00000':
-            return {
-                'orderId':    r['data']['orderId'],
-                'symbol':     symbol,
-                'direction':  direction,
-                'entryPrice': price,
-                'currentPrice': price,
-                'size':       size,
-                'leverage':   leverage,
-                'tp':         tp_price,
-                'sl':         sl_price,
-                'tp_pct':     round(tp_pct*100,2),
-                'sl_pct':     round(sl_pct*100,2),
-                'margin':     round(risk_usdt, 4),
-                'openTime':   datetime.now(timezone.utc).isoformat(),
-                'scoreAtEntry': score_result['score'],
-                'reasons':    score_result['reasons'],
-                'bonus':      score_result.get('bonus',[]),
-                'conviction': conv_cfg['label'],
-                'tier':       cap_cfg['label'],
-                'trailing_high': price,
-                'trailing_active': False,
-                'unrealizedPnl': 0,
-            }
-        else:
+        if r.get('code') != '00000':
             log.error(f'Order failed: {r}')
             return None
 
+        order_id = r['data']['orderId']
+        time.sleep(1.5)  # Attendre que la position soit ouverte
+
+        # ÉTAPE 2 — Poser TP/SL séparément via l'endpoint dédié
+        hold_side = 'long' if direction == 'long' else 'short'
+
+        tp_body = {
+            'symbol':             symbol,
+            'productType':        'USDT-FUTURES',
+            'marginCoin':         'USDT',
+            'planType':           'profit_loss',
+            'triggerPrice':       str(tp_price),
+            'triggerType':        'mark_price',
+            'executePrice':       '0',
+            'holdSide':           hold_side,
+            'size':               str(size),
+            'rangeRate':          '',
+        }
+        tp_r = POST('/api/v2/mix/order/place-tpsl-order', tp_body)
+        log.info(f'TP response: {tp_r}')
+
+        sl_body = {
+            'symbol':             symbol,
+            'productType':        'USDT-FUTURES',
+            'marginCoin':         'USDT',
+            'planType':           'loss_plan',
+            'triggerPrice':       str(sl_price),
+            'triggerType':        'mark_price',
+            'executePrice':       '0',
+            'holdSide':           hold_side,
+            'size':               str(size),
+            'rangeRate':          '',
+        }
+        sl_r = POST('/api/v2/mix/order/place-tpsl-order', sl_body)
+        log.info(f'SL response: {sl_r}')
+
+        if tp_r.get('code') != '00000':
+            log.error(f'TP failed: {tp_r}')
+        if sl_r.get('code') != '00000':
+            log.error(f'SL failed: {sl_r}')
+
+        return {
+            'orderId':      order_id,
+            'symbol':       symbol,
+            'direction':    direction,
+            'entryPrice':   price,
+            'currentPrice': price,
+            'size':         size,
+            'leverage':     lev,
+            'tp':           tp_price,
+            'sl':           sl_price,
+            'tp_pct':       round(TP_PCT * 100, 2),
+            'sl_pct':       round(SL_PCT * 100, 2),
+            'margin':       round(risk, 4),
+            'openTime':     datetime.now(timezone.utc).isoformat(),
+            'scoreAtEntry': scored['score'],
+            'reasons':      scored['reasons'],
+            'direction':    direction,
+            'unrealizedPnl':0.0,
+            'liqPrice':     0.0,
+            'totalSize':    size,
+            'trailing_active': False,
+            'trailing_high':   price,
+        }
+
     except Exception as e:
-        log.error(f'Place order error: {e}')
+        log.error(f'Place order exception: {e}')
         return None
 
-# ── TRAILING STOP ─────────────────────────────────────────────────────
-def update_trailing_stop(pos, cur_price):
-    """Met à jour le trailing stop si le gain dépasse le seuil"""
-    if not pos: return pos, False
-    try:
-        entry = pos['entryPrice']
-        direction = pos['direction']
-
-        if direction == 'long':
-            gain_pct = (cur_price - entry) / entry
-            if gain_pct >= TRAILING_ACTIVE_AT:
-                pos['trailing_active'] = True
-                if cur_price > pos.get('trailing_high', entry):
-                    pos['trailing_high'] = cur_price
-                    new_sl = cur_price * (1 - TRAILING_DISTANCE)
-                    if new_sl > pos['sl']:
-                        pos['sl'] = round(new_sl, 6)
-                        log.info(f'Trailing SL updated to {new_sl:.6f}')
-                        return pos, True
-        else:
-            gain_pct = (entry - cur_price) / entry
-            if gain_pct >= TRAILING_ACTIVE_AT:
-                pos['trailing_active'] = True
-                if cur_price < pos.get('trailing_high', entry):
-                    pos['trailing_high'] = cur_price
-                    new_sl = cur_price * (1 + TRAILING_DISTANCE)
-                    if new_sl < pos['sl']:
-                        pos['sl'] = round(new_sl, 6)
-                        return pos, True
-    except Exception as e:
-        log.warning(f'Trailing error: {e}')
-    return pos, False
-
-# ── CHECK POSITION ────────────────────────────────────────────────────
+# ══ CHECK POSITION ════════════════════════════════════════════════════
 def check_position(state):
-    if not state['position']: return state
+    if not state['position']:
+        return state
 
     positions = get_positions()
-    sym = state['position']['symbol']
-    open_pos = next((p for p in positions if p['symbol'] == sym), None)
+    sym  = state['position']['symbol']
+    pos  = next((p for p in positions if p['symbol'] == sym), None)
 
-    if not open_pos:
-        # Position fermée — récupérer solde réel
+    if not pos:
+        # Position fermée — on compare avec le solde précédent
+        time.sleep(1.0)
         bal_new = get_balance()
-        pnl     = round(bal_new - state['balance'], 4)
-        pos     = state['position']
+        old_bal = state['balance']
+        pnl     = round(bal_new - old_bal, 6)
 
-        result = {
-            **pos,
+        log.info(f'Position closed. Old bal={old_bal} New bal={bal_new} PNL={pnl}')
+
+        record = {
+            **state['position'],
             'closeTime':    datetime.now(timezone.utc).isoformat(),
             'pnl':          pnl,
-            'pnlPct':       round((pnl / pos['margin']) * 100, 2) if pos.get('margin') else 0,
-            'closeBalance': round(bal_new, 4),
-            'exitReason':   'TP/SL/Trailing auto',
+            'pnlPct':       round((pnl / max(state['position'].get('margin', 1), 0.01)) * 100, 2),
+            'closeBalance': round(bal_new, 6),
+            'exitReason':   'TP/SL auto',
         }
-        state['history'].insert(0, result)
-        if len(state['history']) > 100:
-            state['history'] = state['history'][:100]
+        state['history'].insert(0, record)
+        if len(state['history']) > 200:
+            state['history'] = state['history'][:200]
 
-        state['total_pnl'] = round(state.get('total_pnl', 0) + pnl, 4)
-
+        # Update daily PNL
         today = str(datetime.now(timezone.utc).date())
         if state.get('today_date') != today:
-            state['today_pnl'] = 0
+            state['today_pnl'] = 0.0
             state['today_date'] = today
-        state['today_pnl'] = round(state.get('today_pnl', 0) + pnl, 4)
+        state['today_pnl']   = round(state.get('today_pnl', 0) + pnl, 6)
+        state['total_pnl']   = round(state.get('total_pnl', 0) + pnl, 6)
+        state['total_trades']= state.get('total_trades', 0) + 1
 
-        state['total_trades'] = state.get('total_trades', 0) + 1
         if pnl > 0:
-            state['win_trades']          = state.get('win_trades', 0) + 1
-            state['consecutive_wins']    = state.get('consecutive_wins', 0) + 1
-            state['consecutive_losses']  = 0
-            if bal_new > state.get('peak_balance', 0):
-                state['peak_balance'] = round(bal_new, 4)
+            state['win_trades']         = state.get('win_trades', 0) + 1
+            state['consecutive_wins']   = state.get('consecutive_wins', 0) + 1
+            state['consecutive_losses'] = 0
         else:
             state['consecutive_losses'] = state.get('consecutive_losses', 0) + 1
             state['consecutive_wins']   = 0
 
-        state['position'] = None
-        state['balance']  = round(bal_new, 4)
-        state = update_mode(state)
-        state['status'] = f'{"Gain" if pnl>0 else "Perte"}: {pnl:+.4f} USDT — Mode: {state["mode"]}'
-        log.info(f'Trade closed: PNL={pnl:.4f} USDT | New balance: {bal_new}')
+        state['position']      = None
+        state['balance']       = round(bal_new, 6)
+        state['balance_total'] = round(bal_new, 6)
+        state['status']        = f'{"Gain" if pnl>0 else "Perte"}: {pnl:+.4f} USDT'
+
+        # Apprentissage après chaque trade fermé
+        state = update_weights(state)
 
     else:
-        # Position ouverte — sync depuis Bitget (source unique de vérité)
-        unr       = float(open_pos.get('unrealizedPL', 0))
-        cur_price = float(open_pos.get('markPrice', state['position']['entryPrice']))
-        entry     = float(open_pos.get('openPriceAvg', state['position']['entryPrice']))
-        margin    = float(open_pos.get('marginSize', state['position'].get('margin', 0)))
-        leverage  = int(float(open_pos.get('leverage', state['position'].get('leverage', 10))))
-        total_val = float(open_pos.get('total', 0))
-        liq_price = float(open_pos.get('liquidationPrice', 0))
+        # Sync depuis Bitget (source de vérité)
+        unr   = float(pos.get('unrealizedPL', 0))
+        cp    = float(pos.get('markPrice',    state['position']['entryPrice']))
+        entry = float(pos.get('openPriceAvg', state['position']['entryPrice']))
+        marg  = float(pos.get('marginSize',   state['position'].get('margin', 0)))
+        lev   = int(float(pos.get('leverage', state['position'].get('leverage', 15))))
+        liq   = float(pos.get('liquidationPrice', 0))
+        tot   = float(pos.get('total', 0))
 
-        # Sync toutes les valeurs depuis Bitget
         state['position']['unrealizedPnl'] = round(unr, 6)
-        state['position']['currentPrice']  = cur_price
+        state['position']['currentPrice']  = cp
         state['position']['entryPrice']    = entry
-        state['position']['margin']        = round(margin, 4)
-        state['position']['leverage']      = leverage
-        state['position']['liqPrice']      = liq_price
-        state['position']['totalSize']     = total_val
+        state['position']['margin']        = round(marg, 4)
+        state['position']['leverage']      = lev
+        state['position']['liqPrice']      = liq
+        state['position']['totalSize']     = tot
 
-        # Solde total = disponible + marge + PNL non réalisé
+        # Solde total = disponible + marge + PNL live
         avail = get_balance()
-        state['balance_total'] = round(avail + margin + unr, 4)
-        state['balance'] = round(avail, 4)
+        state['balance']       = round(avail, 6)
+        state['balance_total'] = round(avail + marg + unr, 6)
 
-        # Trailing stop
-        state['position'], updated = update_trailing_stop(state['position'], cur_price)
-        if updated:
-            try:
-                api_post('/api/v2/mix/order/modify-tpsl-order', {
-                    'symbol':               sym,
-                    'productType':          'USDT-FUTURES',
-                    'marginCoin':           'USDT',
-                    'stopLossTriggerPrice': str(state['position']['sl']),
-                    'holdSide':             state['position']['direction'],
-                })
-            except: pass
+        # Trailing stop — après +3%
+        ep  = entry
+        dir = state['position']['direction']
+        if dir == 'long':
+            gain_pct = (cp - ep) / ep if ep > 0 else 0
+            if gain_pct >= 0.03:
+                state['position']['trailing_active'] = True
+                if cp > state['position'].get('trailing_high', ep):
+                    state['position']['trailing_high'] = cp
+                    new_sl = round(cp * 0.985, 8)
+                    if new_sl > state['position']['sl']:
+                        state['position']['sl'] = new_sl
+                        log.info(f'Trailing SL → {new_sl}')
+        else:
+            gain_pct = (ep - cp) / ep if ep > 0 else 0
+            if gain_pct >= 0.03:
+                state['position']['trailing_active'] = True
+                if cp < state['position'].get('trailing_high', ep):
+                    state['position']['trailing_high'] = cp
+                    new_sl = round(cp * 1.015, 8)
+                    if new_sl < state['position']['sl']:
+                        state['position']['sl'] = new_sl
+                        log.info(f'Trailing SL → {new_sl}')
 
     return state
 
-# ── MAIN SCAN ─────────────────────────────────────────────────────────
-def scan_and_trade(state):
+# ══ DETECT MANUAL CLOSE ═══════════════════════════════════════════════
+def detect_manual_close(state):
+    """Détecte si l'utilisateur a fermé la position manuellement sur Bitget"""
+    if not state['position']:
+        return state
+
+    positions = get_positions()
+    sym = state['position']['symbol']
+    still_open = any(p['symbol'] == sym for p in positions)
+
+    if not still_open:
+        log.info('Manual close detected')
+        bal_new = get_balance()
+        pnl     = round(bal_new - state['balance'], 6)
+
+        record = {
+            **state['position'],
+            'closeTime':    datetime.now(timezone.utc).isoformat(),
+            'pnl':          pnl,
+            'pnlPct':       round((pnl / max(state['position'].get('margin', 1), 0.01)) * 100, 2),
+            'closeBalance': round(bal_new, 6),
+            'exitReason':   'Fermé manuellement',
+        }
+        state['history'].insert(0, record)
+        if len(state['history']) > 200:
+            state['history'] = state['history'][:200]
+
+        today = str(datetime.now(timezone.utc).date())
+        if state.get('today_date') != today:
+            state['today_pnl'] = 0.0
+            state['today_date'] = today
+
+        state['today_pnl']    = round(state.get('today_pnl', 0) + pnl, 6)
+        state['total_pnl']    = round(state.get('total_pnl', 0) + pnl, 6)
+        state['total_trades'] = state.get('total_trades', 0) + 1
+        if pnl > 0:
+            state['win_trades'] = state.get('win_trades', 0) + 1
+            state['consecutive_wins']   = state.get('consecutive_wins', 0) + 1
+            state['consecutive_losses'] = 0
+        else:
+            state['consecutive_losses'] = state.get('consecutive_losses', 0) + 1
+            state['consecutive_wins']   = 0
+
+        state['position']      = None
+        state['balance']       = round(bal_new, 6)
+        state['balance_total'] = round(bal_new, 6)
+        state['status']        = f'Fermé manuellement — PNL: {pnl:+.4f} USDT'
+        state = update_weights(state)
+
+    return state
+
+# ══ MAIN SCAN ══════════════════════════════════════════════════════════
+def scan(state):
     state['last_scan'] = datetime.now(timezone.utc).isoformat()
-
-    bal = get_balance()
-    if bal > 0:
-        state['balance'] = round(bal, 4)
-        if 'balance_total' not in state or not state.get('position'):
-            state['balance_total'] = round(bal, 4)
-        cap_cfg = get_capital_config(bal, state)
-        state['tier'] = cap_cfg['label']
-
     today = str(datetime.now(timezone.utc).date())
     if state.get('today_date') != today:
-        state['today_pnl'] = 0
+        state['today_pnl'] = 0.0
         state['today_date'] = today
 
-    # Si position ouverte → juste surveiller
+    # Vérifier fermeture manuelle en premier
+    state = detect_manual_close(state)
+
+    # Si position ouverte — juste surveiller
     if state['position']:
         state = check_position(state)
-        pos   = state['position']
+        pos = state['position']
         if pos:
+            unr = pos.get('unrealizedPnl', 0)
+            pct = (unr / pos.get('margin', 1) * 100) if pos.get('margin') else 0
+            trail = ' | Trailing actif' if pos.get('trailing_active') else ''
             state['status'] = (
-                f'📊 {pos["symbol"]} {pos["direction"].upper()} x{pos["leverage"]} — '
-                f'PNL: {pos.get("unrealizedPnl",0):+.4f} USDT'
-                + (' 🎯 Trailing actif' if pos.get('trailing_active') else '')
+                f'{pos["symbol"]} {pos["direction"].upper()} x{pos["leverage"]} — '
+                f'{unr:+.4f} USDT ({pct:+.1f}%){trail}'
             )
         return state
 
     # Scan du marché
-    state['status'] = '🔍 Analyse du marché en cours…'
+    state['status'] = 'Analyse du marché…'
+    bal = get_balance()
+    if bal > 0:
+        state['balance'] = round(bal, 6)
+        state['balance_total'] = round(bal, 6)
+
     tickers = get_tickers()
     if not tickers:
-        state['status'] = '⚠️ Erreur API marché'
+        state['status'] = 'Erreur API marché'
         return state
 
-    # Top 25 par volume
-    top_tickers = sorted(tickers, key=lambda x: float(x.get('usdtVolume',0)), reverse=True)[:25]
-
+    # Top 30 par volume
+    top = sorted(tickers, key=lambda x: float(x.get('usdtVolume', 0)), reverse=True)[:30]
     candidates = []
-    for ticker in top_tickers:
-        sym = ticker.get('symbol','')
-        if not sym.endswith('USDT') or sym in ['USDCUSDT','TUSDUSDT','BUSDUSDT']: continue
+    weights = state.get('score_weights', {
+        'rsi':1.0,'macd':1.0,'volume':1.0,'breakout':1.0,'range':1.0,'funding':1.0
+    })
 
-        state['signals_checked'] = state.get('signals_checked',0) + 1
+    for tk in top:
+        sym = tk.get('symbol', '')
+        if not sym.endswith('USDT'): continue
+        if sym in ['USDCUSDT','TUSDUSDT','BUSDUSDT','FDUSDUSDT']: continue
 
-        c1m  = get_candles(sym, '1m',  100)
-        time.sleep(0.08)
-        c5m  = get_candles(sym, '5m',  100)
-        time.sleep(0.08)
-        c15m = get_candles(sym, '15m', 60)
-        time.sleep(0.08)
-        c1h  = get_candles(sym, '1H',  50)
-        time.sleep(0.08)
+        state['signals_checked'] = state.get('signals_checked', 0) + 1
 
-        result = score_symbol(ticker, c1m, c5m, c15m, c1h)
-        if result and result['score'] >= MIN_SCORE_ENTRY:
-            candidates.append({'symbol':sym, **result})
-            log.info(f'Candidate: {sym} score={result["score"]} dir={result["direction"]}')
+        c1m  = get_candles(sym, '1m', 100); time.sleep(0.07)
+        c5m  = get_candles(sym, '5m', 100); time.sleep(0.07)
+        c15m = get_candles(sym, '15m', 60); time.sleep(0.07)
+        c1h  = get_candles(sym, '1H', 50);  time.sleep(0.07)
 
-    state['status'] = f'Scan terminé — {len(candidates)} signaux sur {len(top_tickers)} paires'
+        res = score_token(tk, c1m, c5m, c15m, c1h, weights)
+        if res and res['score'] >= MIN_SCORE:
+            candidates.append({'symbol': sym, **res})
+            log.info(f'Candidate: {sym} score={res["score"]} dir={res["direction"]}')
+
+    state['status'] = f'Scan terminé — {len(candidates)} signaux sur {len(top)} paires'
 
     if not candidates:
-        state['status'] = '⏳ Aucun signal fort — surveillance continue'
+        state['status'] = 'Aucun signal fort — surveillance continue'
         return state
 
-    # Meilleur candidat
     best = sorted(candidates, key=lambda x: x['score'], reverse=True)[0]
-    state['status'] = f'🎯 Signal: {best["symbol"]} ({best["direction"].upper()}) {best["score"]}/100 — Ouverture…'
-    log.info(f'Best signal: {best}')
+    log.info(f'Best: {best["symbol"]} score={best["score"]} dir={best["direction"]}')
 
-    pos = place_order(best['symbol'], best['direction'], state['balance'], best, state)
+    state['status'] = f'Signal: {best["symbol"]} {best["direction"].upper()} score={best["score"]} — Ouverture…'
+
+    pos = place_order(best['symbol'], best['direction'], state['balance'], best)
     if pos:
         state['position'] = pos
         state['status'] = (
-            f'✅ {pos["symbol"]} {pos["direction"].upper()} x{pos["leverage"]} — '
-            f'TP: +{pos["tp_pct"]}% | SL: -{pos["sl_pct"]}% | '
-            f'Conviction: {pos["conviction"]}'
+            f'{pos["symbol"]} {pos["direction"].upper()} x{pos["leverage"]} ouvert — '
+            f'TP: +{pos["tp_pct"]}% | SL: -{pos["sl_pct"]}%'
         )
+        log.info(f'Position opened: {pos["symbol"]} {pos["direction"]} x{pos["leverage"]}')
     else:
-        state['status'] = f'⚠️ Échec ordre sur {best["symbol"]} — prochaine tentative'
+        state['status'] = f'Échec ordre {best["symbol"]} — prochaine tentative'
 
     return state
 
-# ── FLASK API ─────────────────────────────────────────────────────────
+# ══ FLASK ═══════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
-def cors(data):
-    resp = Response(json.dumps(data, default=str), mimetype='application/json')
-    resp.headers['Access-Control-Allow-Origin'] = '*'
-    return resp
+def cors_json(data):
+    r = Response(json.dumps(data, default=str), mimetype='application/json')
+    r.headers['Access-Control-Allow-Origin'] = '*'
+    return r
 
 @app.route('/')
 def root():
-    return cors({'status': 'Portal David Bot — Running', 'version': '2.0'})
+    return cors_json({'status': 'Portal David Bot v3', 'ok': True})
 
 @app.route('/api/state')
 def api_state():
-    return cors(load_state())
+    return cors_json(load_state())
 
 @app.route('/api/health')
 def api_health():
-    return cors({'ok': True, 'ts': datetime.now(timezone.utc).isoformat()})
+    return cors_json({'ok': True, 'ts': datetime.now(timezone.utc).isoformat()})
 
-# ── BOT LOOP ──────────────────────────────────────────────────────────
+# ══ BOT LOOP ════════════════════════════════════════════════════════════
 def bot_loop():
-    global STATE
-    log.info('Portal David Bot v2 starting…')
-    time.sleep(8)
-
+    global S
+    log.info('Portal David Bot v3 starting…')
+    time.sleep(6)
     while True:
         try:
-            STATE = scan_and_trade(STATE)
-            save_state(STATE)
+            S = scan(S)
+            save_state(S)
         except Exception as e:
-            log.error(f'Bot loop error: {e}')
-            STATE['status'] = f'❌ Erreur: {str(e)[:100]}'
-            save_state(STATE)
-        time.sleep(SCAN_INTERVAL)
+            log.error(f'Loop error: {e}')
+            S['status'] = f'Erreur: {str(e)[:80]}'
+            save_state(S)
+        time.sleep(SCAN_SEC)
 
-# ── DÉMARRAGE DU BOT — compatible gunicorn ───────────────────────────
-# Le thread démarre dès que le module est importé (gunicorn importe main)
-_bot_thread = Thread(target=bot_loop, daemon=True)
-_bot_thread.start()
-log.info('Bot thread started via module import')
+Thread(target=bot_loop, daemon=True).start()
+log.info('Bot thread launched')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
