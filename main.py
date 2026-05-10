@@ -162,6 +162,146 @@ def get_funding(symbol):
     except:
         return 0.0
 
+# ══ ADVANCED SIGNALS — ce que les autres bots ne font pas ══════════════
+
+def get_open_interest(symbol):
+    """Open interest — mesure l'argent réel dans le marché"""
+    r = GET('/api/v2/mix/market/open-interest', {
+        'symbol': symbol, 'productType': 'USDT-FUTURES'
+    })
+    try:
+        items = r.get('data', {}).get('openInterestList', [])
+        if items:
+            return float(items[0].get('size', 0))
+    except:
+        pass
+    return 0.0
+
+def get_orderbook_imbalance(symbol):
+    """
+    Déséquilibre carnet d'ordres — si 3x plus d'achats que de ventes
+    dans le top 5 niveaux = pression d'achat forte
+    """
+    r = GET('/api/v2/mix/market/merge-depth', {
+        'symbol': symbol, 'productType': 'USDT-FUTURES',
+        'precision': 'scale0', 'limit': '10'
+    })
+    try:
+        d    = r.get('data', {})
+        bids = d.get('bids', [])  # achats
+        asks = d.get('asks', [])  # ventes
+        if not bids or not asks:
+            return 0.0
+        bid_vol = sum(float(b[1]) for b in bids[:5])
+        ask_vol = sum(float(a[1]) for a in asks[:5])
+        if ask_vol == 0:
+            return 3.0
+        return bid_vol / ask_vol  # >1.5 = pression achat, <0.7 = pression vente
+    except:
+        return 1.0
+
+def get_liquidation_data(symbol):
+    """
+    Données de liquidation — si beaucoup de shorts liquidés = squeeze haussier
+    Retourne: (longs_liquidés, shorts_liquidés) en USDT
+    """
+    r = GET('/api/v2/mix/market/liquidation-order', {
+        'symbol': symbol, 'productType': 'USDT-FUTURES'
+    })
+    try:
+        data = r.get('data', {}).get('liquidationOrderList', [])
+        longs_liq  = sum(float(x.get('size', 0)) * float(x.get('price', 0))
+                        for x in data if x.get('side') == 'buy')
+        shorts_liq = sum(float(x.get('size', 0)) * float(x.get('price', 0))
+                        for x in data if x.get('side') == 'sell')
+        return longs_liq, shorts_liq
+    except:
+        return 0.0, 0.0
+
+def get_btc_momentum():
+    """
+    Momentum BTC sur 5 minutes — si BTC pompe fort,
+    les alts suivent avec 5-15 min de retard
+    """
+    r = GET('/api/v2/mix/market/candles', {
+        'symbol': 'BTCUSDT', 'productType': 'USDT-FUTURES',
+        'granularity': '1m', 'limit': '10'
+    })
+    try:
+        candles = r.get('data', [])
+        if len(candles) < 5:
+            return 0.0
+        opens  = [float(c[1]) for c in candles[-5:]]
+        closes = [float(c[4]) for c in candles[-5:]]
+        chg    = (closes[-1] - opens[0]) / opens[0] * 100
+        return chg
+    except:
+        return 0.0
+
+def advanced_score_boost(symbol, direction, base_score):
+    """
+    Boost le score avec les signaux avancés.
+    Retourne (boost_pts, advanced_reasons)
+    """
+    boost = 0
+    reasons = []
+
+    try:
+        # 1. ORDER BOOK IMBALANCE
+        imbalance = get_orderbook_imbalance(symbol)
+        if direction == 'long' and imbalance > 2.0:
+            boost += 15
+            reasons.append(f"Carnet d'ordres: {imbalance:.1f}x plus d'acheteurs que vendeurs")
+        elif direction == 'long' and imbalance > 1.5:
+            boost += 8
+        elif direction == 'short' and imbalance < 0.5:
+            boost += 15
+            reasons.append("Carnet d'ordres: pression vendeuse massive")
+        elif direction == 'long' and imbalance < 0.6:
+            boost -= 10  # contre-signal
+        time.sleep(0.05)
+
+        # 2. LIQUIDATION CASCADE DETECTION
+        longs_liq, shorts_liq = get_liquidation_data(symbol)
+        if direction == 'long' and shorts_liq > longs_liq * 2 and shorts_liq > 50000:
+            boost += 18
+            reasons.append(f'Cascade de liquidations shorts — squeeze haussier probable')
+        elif direction == 'short' and longs_liq > shorts_liq * 2 and longs_liq > 50000:
+            boost += 18
+            reasons.append('Cascade de liquidations longs — dump probable')
+        time.sleep(0.05)
+
+        # 3. OPEN INTEREST CONFIRMATION
+        # On compare avec 30 min avant via les candles OI
+        # Si prix monte ET OI monte = vrais acheteurs
+        # Si prix monte ET OI baisse = fermeture de shorts seulement (moins fiable)
+        # Simplifié: on check juste la valeur absolue
+        oi = get_open_interest(symbol)
+        if oi > 5_000_000 and direction == 'long':
+            boost += 8
+            reasons.append(f'Open interest élevé — liquidité confirmée')
+        elif oi > 1_000_000:
+            boost += 4
+        time.sleep(0.05)
+
+        # 4. BTC CORRELATION PLAY
+        btc_mom = get_btc_momentum()
+        if abs(btc_mom) > 0.8:  # BTC bouge de +0.8% en 5min
+            if btc_mom > 0 and direction == 'long':
+                boost += 12
+                reasons.append(f'BTC +{btc_mom:.2f}% sur 5min — vague haussière en cours')
+            elif btc_mom < 0 and direction == 'short':
+                boost += 12
+                reasons.append(f'BTC {btc_mom:.2f}% sur 5min — vague baissière en cours')
+            elif btc_mom > 1.5 and direction == 'long':
+                boost += 5  # bonus supplémentaire si BTC très fort
+
+    except Exception as e:
+        log.warning(f'Advanced signals error {symbol}: {e}')
+
+    return boost, reasons[:3]
+
+
 # ══ INDICATORS ════════════════════════════════════════════════════════
 def rsi(closes, n=14):
     if len(closes) < n + 1: return 50.0
@@ -323,17 +463,25 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights):
         atr_pct = (a / price * 100) if price > 0 else 0
         if atr_pct > 4: score -= 12  # trop volatile
 
+        # ── ADVANCED SIGNALS BOOST ──────────────────────────────
+        adv_boost, adv_reasons = advanced_score_boost(
+            ticker.get('symbol',''), direction, score
+        )
+        score += adv_boost
+        reasons = (adv_reasons + reasons)[:4]
+
         final = min(100, max(0, round(score)))
         return {
             'score':     final,
             'direction': direction,
-            'reasons':   reasons[:3],
+            'reasons':   reasons[:4],
             'atr_pct':   round(atr_pct, 3),
             'vol_spike': round(vs, 2),
             'rsi_1m':    round(r1m, 1),
             'rsi_5m':    round(r5m, 1),
             'funding':   round(fund, 4),
             'chg24':     round(chg24, 2),
+            'adv_boost': adv_boost,
         }
     except Exception as e:
         log.warning(f'Score error: {e}')
@@ -795,6 +943,94 @@ def api_state():
 @app.route('/api/health')
 def api_health():
     return cors_json({'ok': True, 'ts': datetime.now(timezone.utc).isoformat()})
+
+@app.route('/api/chat', methods=['POST', 'OPTIONS'])
+def api_chat():
+    """Chat avec le bot — explique ses décisions en français simple"""
+    from flask import request
+    if request.method == 'OPTIONS':
+        r = Response('', 204)
+        r.headers['Access-Control-Allow-Origin']  = '*'
+        r.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return r
+
+    try:
+        body     = request.get_json(force=True)
+        question = body.get('question', '').strip()[:500]
+        if not question:
+            return cors_json({'answer': 'Pose-moi une question sur mes trades.'})
+
+        state = load_state()
+        pos   = state.get('position')
+        hist  = state.get('history', [])[:5]
+        bal   = state.get('balance_total', state.get('balance', 0))
+
+        # Contexte du bot pour l'IA
+        context = f"""Tu es le bot de trading de David. Tu parles en français simple, sans jargon financier.
+Voici ton état actuel:
+- Solde: ${bal:.2f} USDT
+- Mode: {state.get('mode', 'Normal')}
+- Trades fermés: {state.get('total_trades', 0)} ({state.get('win_trades', 0)} gagnants)
+- PNL aujourd'hui: {state.get('today_pnl', 0):+.4f} USDT
+- PNL total: {state.get('total_pnl', 0):+.4f} USDT
+"""
+        if pos:
+            unr = pos.get('unrealizedPnl', 0)
+            ep  = pos.get('entryPrice', 0)
+            cp  = pos.get('currentPrice', ep)
+            pct = ((cp - ep) / ep * 100) if ep > 0 else 0
+            context += f"""
+Position ouverte:
+- Coin: {pos.get('symbol')}
+- Direction: {pos.get('direction', '').upper()}
+- Levier: x{pos.get('leverage')}
+- Prix d'entrée: ${ep}
+- Prix actuel: ${cp}
+- P&L: {unr:+.4f} USDT ({pct:+.2f}%)
+- Take Profit: ${pos.get('tp')}
+- Stop Loss: ${pos.get('sl')}
+- Score de confiance: {pos.get('scoreAtEntry', 0)}/100
+- Raisons: {', '.join(pos.get('reasons', []))}
+"""
+        if hist:
+            context += "\n5 derniers trades:"
+            for h in hist:
+                context += f"\n- {h.get('symbol')} {h.get('direction','').upper()}: {h.get('pnl', 0):+.4f} USDT ({h.get('exitReason', 'auto')})"
+
+        context += f"""\n\nStratégie:
+- Tu analyses RSI multi-TF, MACD, volume, breakouts, carnet d'ordres, liquidations, momentum BTC
+- Levier x15-20, TP à +5%, SL à -2.5%
+- Tu ajustes tes poids selon les performances passées (apprentissage adaptatif)
+- Objectif: 94.36$ → 100 000$
+"""
+        # Appel API Claude
+        import urllib.request
+        payload = json.dumps({
+            'model': 'claude-sonnet-4-20250514',
+            'max_tokens': 300,
+            'system': context,
+            'messages': [{'role': 'user', 'content': question}]
+        }).encode()
+
+        req = urllib.request.Request(
+            'https://api.anthropic.com/v1/messages',
+            data=payload,
+            headers={
+                'Content-Type':      'application/json',
+                'anthropic-version': '2023-06-01',
+            },
+            method='POST'
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+            answer = data['content'][0]['text']
+
+        return cors_json({'answer': answer})
+
+    except Exception as e:
+        log.error(f'Chat error: {e}')
+        return cors_json({'answer': f'Erreur: {str(e)[:100]}'})
 
 # ══ BOT LOOP ════════════════════════════════════════════════════════════
 def bot_loop():
