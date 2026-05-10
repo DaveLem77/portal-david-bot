@@ -791,7 +791,12 @@ def bot_loop():
             save_state(STATE)
         time.sleep(SCAN_INTERVAL)
 
+# ── DÉMARRAGE DU BOT — compatible gunicorn ───────────────────────────
+# Le thread démarre dès que le module est importé (gunicorn importe main)
+_bot_thread = Thread(target=bot_loop, daemon=True)
+_bot_thread.start()
+log.info('Bot thread started via module import')
+
 if __name__ == '__main__':
-    Thread(target=bot_loop, daemon=True).start()
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
