@@ -154,9 +154,25 @@ def api_post(path, body):
 def get_balance():
     try:
         r = api_get('/api/v2/mix/account/account', {'productType':'USDT-FUTURES','marginCoin':'USDT'})
-        if r.get('code') == '00000':
-            return float(r['data']['available'])
-    except: pass
+        log.info(f'Balance ep1: {str(r)[:200]}')
+        if r.get('code') == '00000' and r.get('data'):
+            d = r['data']
+            for k in ['available','availableAmount','crossedMaxAvailable']:
+                if d.get(k) is not None and float(d.get(k,0)) >= 0:
+                    log.info(f'Balance found via {k}: {d[k]}')
+                    return float(d[k])
+    except Exception as e:
+        log.error(f'Balance ep1: {e}')
+    try:
+        r = api_get('/api/v2/mix/account/accounts', {'productType':'USDT-FUTURES'})
+        log.info(f'Balance ep2: {str(r)[:200]}')
+        if r.get('code') == '00000' and r.get('data'):
+            for acc in r['data']:
+                if acc.get('marginCoin','').upper() == 'USDT':
+                    val = acc.get('available') or acc.get('availableAmount','0')
+                    return float(val)
+    except Exception as e:
+        log.error(f'Balance ep2: {e}')
     return 0
 
 def get_positions():
