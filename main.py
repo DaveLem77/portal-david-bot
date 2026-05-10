@@ -1013,12 +1013,17 @@ Position ouverte:
             'messages': [{'role': 'user', 'content': question}]
         }).encode()
 
+        api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+        if not api_key:
+            return cors_json({'answer': 'Clé API Anthropic manquante. Ajoute ANTHROPIC_API_KEY dans les variables Render.'})
+
         req = urllib.request.Request(
             'https://api.anthropic.com/v1/messages',
             data=payload,
             headers={
                 'Content-Type':      'application/json',
                 'anthropic-version': '2023-06-01',
+                'x-api-key':         api_key,
             },
             method='POST'
         )
