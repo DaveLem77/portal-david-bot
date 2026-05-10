@@ -1037,6 +1037,31 @@ Position ouverte:
         log.error(f'Chat error: {e}')
         return cors_json({'answer': f'Erreur: {str(e)[:100]}'})
 
+@app.route('/api/candles')
+def api_candles():
+    """Retourne les chandeliers 1m pour le graphique live"""
+    from flask import request
+    symbol = request.args.get('symbol', 'BTCUSDT')
+    try:
+        r = GET('/api/v2/mix/market/candles', {
+            'symbol': symbol, 'productType': 'USDT-FUTURES',
+            'granularity': '1m', 'limit': '60'
+        })
+        candles = []
+        if r.get('code') == '00000':
+            for c in r.get('data', []):
+                candles.append({
+                    'ts': int(c[0]),
+                    'o':  float(c[1]),
+                    'h':  float(c[2]),
+                    'l':  float(c[3]),
+                    'c':  float(c[4]),
+                    'v':  float(c[5]),
+                })
+        return cors_json({'candles': candles, 'symbol': symbol})
+    except Exception as e:
+        return cors_json({'candles': [], 'error': str(e)})
+
 # ══ BOT LOOP ════════════════════════════════════════════════════════════
 def bot_loop():
     global S
