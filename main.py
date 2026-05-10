@@ -22,12 +22,12 @@ BASE_URL   = 'https://api.bitget.com'
 # Capital par tranche — le bot adapte sa stratégie
 CAPITAL_TIERS = [
     # (max_capital, risk_pct, max_leverage, label)
-    (200,    0.05, 5,  'Micro'),      # 94–200$   : prudent, construire la base
-    (500,    0.06, 8,  'Petit'),      # 200–500$  : légèrement plus agressif
-    (2000,   0.07, 12, 'Moyen'),      # 500–2k$   : on accélère
-    (10000,  0.08, 15, 'Croissance'), # 2k–10k$   : momentum
-    (50000,  0.06, 20, 'Grand'),      # 10k–50k$  : prudent à grande échelle
-    (999999, 0.05, 25, 'Élite'),      # 50k+$     : capital institutionnel
+    (200,    0.95, 10, 'Micro'),      # 94–200$   : agressif
+    (500,    0.95, 15, 'Petit'),      # 200–500$  : très agressif
+    (2000,   0.95, 20, 'Moyen'),      # 500–2k$   : maximum
+    (10000,  0.95, 25, 'Croissance'), # 2k–10k$   : institutionnel
+    (50000,  0.95, 25, 'Grand'),      # 10k–50k$  : élite
+    (999999, 0.95, 25, 'Élite'),      # 50k+$     : élite
 ]
 
 # TP/SL dynamiques selon la conviction (score)
@@ -40,7 +40,7 @@ CONVICTION_TIERS = [
 ]
 
 SCAN_INTERVAL   = 45   # secondes
-MIN_SCORE_ENTRY = 65   # score minimum pour entrer
+MIN_SCORE_ENTRY = 60   # score minimum pour entrer
 MIN_VOLUME_24H  = 10_000_000  # volume min USDT
 TRAILING_ACTIVE_AT = 0.03  # activer trailing après +3% de gain
 TRAILING_DISTANCE  = 0.015 # trailing à 1.5% du plus haut
@@ -480,13 +480,13 @@ def place_order(symbol, direction, balance, score_result, state):
         if score >= 85:
             leverage = base_lev
         elif score >= 75:
-            leverage = max(int(base_lev * 0.85), 3)
+            leverage = max(int(base_lev * 0.9), 10)
         else:
-            leverage = max(int(base_lev * 0.7), 3)
+            leverage = max(int(base_lev * 0.8), 10)
 
-        # Réduire levier si volatilité élevée
-        if atr_pct > 2.0:
-            leverage = max(int(leverage * 0.6), 3)
+        # Réduire levier si volatilité extrême seulement
+        if atr_pct > 3.0:
+            leverage = max(int(leverage * 0.75), 10)
 
         set_leverage(symbol, leverage)
         time.sleep(0.3)
@@ -497,7 +497,7 @@ def place_order(symbol, direction, balance, score_result, state):
         price = float(tk['data'][0]['lastPr'])
 
         # Taille position
-        risk_usdt = balance * cap_cfg['risk']
+        risk_usdt = balance * 0.95  # 95% du capital total
         pos_value = risk_usdt * leverage
         info      = get_contract_info(symbol)
         size_dec  = int(info.get('volumePlace',0)) if info else 1
@@ -620,70 +620,85 @@ def check_position(state):
 
     positions = get_positions()
     sym = state['position']['symbol']
-    open_pos  = next((p for p in positions if p['symbol'] == sym), None)
+    open_pos = next((p for p in positions if p['symbol'] == sym), None)
 
     if not open_pos:
-        # Position fermée — calculer le PNL
+        # Position fermée — récupérer solde réel
         bal_new = get_balance()
         pnl     = round(bal_new - state['balance'], 4)
         pos     = state['position']
 
         result = {
             **pos,
-            'closeTime':   datetime.now(timezone.utc).isoformat(),
-            'pnl':         pnl,
-            'pnlPct':      round((pnl / pos['margin']) * 100, 2) if pos.get('margin') else 0,
+            'closeTime':    datetime.now(timezone.utc).isoformat(),
+            'pnl':          pnl,
+            'pnlPct':       round((pnl / pos['margin']) * 100, 2) if pos.get('margin') else 0,
             'closeBalance': round(bal_new, 4),
-            'exitReason':  'TP/SL/Trailing auto',
+            'exitReason':   'TP/SL/Trailing auto',
         }
         state['history'].insert(0, result)
         if len(state['history']) > 100:
             state['history'] = state['history'][:100]
 
-        state['total_pnl'] = round(state.get('total_pnl',0) + pnl, 4)
+        state['total_pnl'] = round(state.get('total_pnl', 0) + pnl, 4)
 
         today = str(datetime.now(timezone.utc).date())
         if state.get('today_date') != today:
             state['today_pnl'] = 0
             state['today_date'] = today
-        state['today_pnl'] = round(state.get('today_pnl',0) + pnl, 4)
+        state['today_pnl'] = round(state.get('today_pnl', 0) + pnl, 4)
 
-        state['total_trades'] = state.get('total_trades',0) + 1
+        state['total_trades'] = state.get('total_trades', 0) + 1
         if pnl > 0:
-            state['win_trades'] = state.get('win_trades',0) + 1
-            state['consecutive_wins']   = state.get('consecutive_wins',0) + 1
-            state['consecutive_losses'] = 0
-            # Mettre à jour le peak
+            state['win_trades']          = state.get('win_trades', 0) + 1
+            state['consecutive_wins']    = state.get('consecutive_wins', 0) + 1
+            state['consecutive_losses']  = 0
             if bal_new > state.get('peak_balance', 0):
                 state['peak_balance'] = round(bal_new, 4)
         else:
-            state['consecutive_losses'] = state.get('consecutive_losses',0) + 1
+            state['consecutive_losses'] = state.get('consecutive_losses', 0) + 1
             state['consecutive_wins']   = 0
 
         state['position'] = None
         state['balance']  = round(bal_new, 4)
         state = update_mode(state)
-        state['status'] = f'{"✅ Gain" if pnl>0 else "❌ Perte"}: {pnl:+.4f} USDT — Mode: {state["mode"]}'
-        log.info(f'Trade closed: PNL={pnl:.4f} USDT')
+        state['status'] = f'{"Gain" if pnl>0 else "Perte"}: {pnl:+.4f} USDT — Mode: {state["mode"]}'
+        log.info(f'Trade closed: PNL={pnl:.4f} USDT | New balance: {bal_new}')
 
     else:
-        # Position toujours ouverte — mettre à jour
-        unr      = float(open_pos.get('unrealizedPL', 0))
-        cur_price= float(open_pos.get('markPrice', state['position']['entryPrice']))
+        # Position ouverte — sync depuis Bitget (source unique de vérité)
+        unr       = float(open_pos.get('unrealizedPL', 0))
+        cur_price = float(open_pos.get('markPrice', state['position']['entryPrice']))
+        entry     = float(open_pos.get('openPriceAvg', state['position']['entryPrice']))
+        margin    = float(open_pos.get('marginSize', state['position'].get('margin', 0)))
+        leverage  = int(float(open_pos.get('leverage', state['position'].get('leverage', 10))))
+        total_val = float(open_pos.get('total', 0))
+        liq_price = float(open_pos.get('liquidationPrice', 0))
+
+        # Sync toutes les valeurs depuis Bitget
         state['position']['unrealizedPnl'] = round(unr, 6)
         state['position']['currentPrice']  = cur_price
+        state['position']['entryPrice']    = entry
+        state['position']['margin']        = round(margin, 4)
+        state['position']['leverage']      = leverage
+        state['position']['liqPrice']      = liq_price
+        state['position']['totalSize']     = total_val
+
+        # Solde total = disponible + marge + PNL non réalisé
+        avail = get_balance()
+        state['balance_total'] = round(avail + margin + unr, 4)
+        state['balance'] = round(avail, 4)
 
         # Trailing stop
         state['position'], updated = update_trailing_stop(state['position'], cur_price)
         if updated:
-            # Modifier le SL sur Bitget
             try:
                 api_post('/api/v2/mix/order/modify-tpsl-order', {
-                    'symbol':      sym,
-                    'productType': 'USDT-FUTURES',
-                    'marginCoin':  'USDT',
+                    'symbol':               sym,
+                    'productType':          'USDT-FUTURES',
+                    'marginCoin':           'USDT',
                     'stopLossTriggerPrice': str(state['position']['sl']),
-                    'holdSide': state['position']['direction'],
+                    'holdSide':             state['position']['direction'],
                 })
             except: pass
 
@@ -696,6 +711,8 @@ def scan_and_trade(state):
     bal = get_balance()
     if bal > 0:
         state['balance'] = round(bal, 4)
+        if 'balance_total' not in state or not state.get('position'):
+            state['balance_total'] = round(bal, 4)
         cap_cfg = get_capital_config(bal, state)
         state['tier'] = cap_cfg['label']
 
@@ -729,7 +746,7 @@ def scan_and_trade(state):
     candidates = []
     for ticker in top_tickers:
         sym = ticker.get('symbol','')
-        if not sym.endswith('USDT'): continue
+        if not sym.endswith('USDT') or sym in ['USDCUSDT','TUSDUSDT','BUSDUSDT']: continue
 
         state['signals_checked'] = state.get('signals_checked',0) + 1
 
