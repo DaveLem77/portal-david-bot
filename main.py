@@ -770,43 +770,68 @@ def check_position(state):
         state['balance']       = round(avail, 6)
         state['balance_total'] = round(avail + marg + unr, 6)
 
-        # ── TRAILING STOP PROGRESSIF INTELLIGENT ──────────────────────
+        # ── TRAILING STOP INTELLIGENT ──────────────────────────────────
         ep   = entry
         dirp = state['position']['direction']
-
-        def calc_smart_sl(ep, cp, direction):
-            """SL progressif — laisse les gros moves se développer"""
-            gain = (cp - ep) / ep if direction == 'long' else (ep - cp) / ep
-            if gain < TRAIL_START:
-                # Pas encore de trailing — SL initial seulement
-                return None
-            elif gain >= TRAIL_STEP4:  # +55%+
-                lock = 0.38  # SL à +38% du prix d'entrée
-            elif gain >= TRAIL_STEP3:  # +40%+
-                lock = 0.25  # SL à +25%
-            elif gain >= TRAIL_STEP2:  # +25%+
-                lock = 0.12  # SL à +12%
-            elif gain >= TRAIL_STEP1:  # +15%+
-                lock = 0.05  # SL à +5% — garanti gagnant
-
-            # Calculer le SL basé sur le prix d'entrée (pas le prix actuel)
-            # pour éviter de couper trop tôt sur une correction normale
-            if direction == 'long':
-                return round(ep * (1 + lock), 8)
-            else:
-                return round(ep * (1 - lock), 8)
+        liq  = state['position'].get('liqPrice', 0)
 
         gain_pct = (cp - ep) / ep if dirp == 'long' else (ep - cp) / ep
-        new_sl   = calc_smart_sl(ep, cp, dirp)
+        sl_updated = False
+        new_sl = None
 
-        if new_sl is not None:
+        if gain_pct >= TRAIL_STEP4:       # +55%+  → lock +38%
+            lock = 0.38
+        elif gain_pct >= TRAIL_STEP3:      # +40%+  → lock +25%
+            lock = 0.25
+        elif gain_pct >= TRAIL_STEP2:      # +25%+  → lock +12%
+            lock = 0.12
+        elif gain_pct >= TRAIL_STEP1:      # +15%+  → lock +5%
+            lock = 0.05
+        else:
+            lock = None  # pas encore de trailing
+
+        if lock is not None:
             state['position']['trailing_active'] = True
-            if dirp == 'long' and new_sl > state['position']['sl']:
-                state['position']['sl'] = new_sl
-                log.info(f'Smart trailing SL → {new_sl:.8f} (gain: {gain_pct*100:.1f}%)')
-            elif dirp == 'short' and new_sl < state['position']['sl']:
-                state['position']['sl'] = new_sl
-                log.info(f'Smart trailing SL → {new_sl:.8f} (gain: {gain_pct*100:.1f}%)')
+            if dirp == 'long':
+                candidate = round(ep * (1 + lock), 8)
+                # SÉCURITÉ CRITIQUE — jamais sous la liquidation
+                if liq > 0:
+                    candidate = max(candidate, round(liq * 1.02, 8))
+                # Seulement monter le SL, jamais le descendre
+                if candidate > state['position']['sl']:
+                    new_sl = candidate
+                    sl_updated = True
+            else:  # short
+                candidate = round(ep * (1 - lock), 8)
+                # SÉCURITÉ CRITIQUE — jamais au-dessus de la liquidation
+                if liq > 0:
+                    candidate = min(candidate, round(liq * 0.98, 8))
+                # Seulement descendre le SL, jamais le monter
+                if candidate < state['position']['sl']:
+                    new_sl = candidate
+                    sl_updated = True
+
+        if sl_updated and new_sl:
+            state['position']['sl'] = new_sl
+            log.info(f'Trailing SL → {new_sl} (gain: {gain_pct*100:.1f}%)')
+            # Modifier le SL sur Bitget via l'API
+            try:
+                hold_side = 'long' if dirp == 'long' else 'short'
+                # Annuler l'ancien SL et en poser un nouveau
+                sl_r = POST('/api/v2/mix/order/place-tpsl-order', {
+                    'symbol':       sym,
+                    'productType':  'USDT-FUTURES',
+                    'marginCoin':   'USDT',
+                    'planType':     'loss_plan',
+                    'triggerPrice': str(new_sl),
+                    'triggerType':  'mark_price',
+                    'executePrice': '0',
+                    'holdSide':     hold_side,
+                    'size':         str(state['position'].get('totalSize', 0)),
+                })
+                log.info(f'SL update on Bitget: {sl_r.get("code")} {sl_r.get("msg","")}')
+            except Exception as e:
+                log.warning(f'SL update failed: {e}')
 
         # ── SORTIE FORCÉE à MAX_GAIN ────────────────────────────────────
         if gain_pct >= MAX_GAIN_PCT:
