@@ -584,11 +584,19 @@ def place_order(symbol, direction, balance, scored):
             min_size  = float(d.get('minTradeNum', 0.01))
             price_dec = int(d.get('pricePlace', 6))
 
-        # Taille position — 90% du capital × levier
-        risk  = balance * RISK_PCT
+        # Taille position — marge réelle = balance × RISK_PCT
+        # La taille en contrats = (marge × levier) / prix
+        # On limite à 85% pour laisser de la marge de frais
+        risk  = balance * min(RISK_PCT, 0.85)
         size  = (risk * lev) / price
         size  = max(size, min_size)
-        size  = round(size, size_dec) if size_dec > 0 else max(1, math.floor(size))
+        # Arrondir vers le bas pour ne jamais dépasser
+        if size_dec > 0:
+            size = math.floor(size * (10**size_dec)) / (10**size_dec)
+        else:
+            size = math.floor(size)
+        size = max(size, min_size)
+        log.info(f'Size calc: balance={balance} risk={risk:.4f} lev={lev} price={price} size={size}')
 
         # TP et SL — prix absolus arrondis correctement
         def rnd(p):
@@ -602,6 +610,14 @@ def place_order(symbol, direction, balance, scored):
             tp_price = rnd(price * (1 - TP_PCT))
             sl_price = rnd(price * (1 + SL_PCT))
             side     = 'sell'
+
+        # Vérification: SL ne doit pas être plus proche que 2× le SL_PCT
+        # On s'assure d'un minimum de distance
+        min_sl_dist = price * SL_PCT * 0.5
+        if direction == 'long':
+            sl_price = min(sl_price, rnd(price - min_sl_dist))
+        else:
+            sl_price = max(sl_price, rnd(price + min_sl_dist))
 
         log.info(f'Order: {symbol} {side} size={size} price={price} TP={tp_price} SL={sl_price} lev=x{lev}')
 
@@ -624,40 +640,67 @@ def place_order(symbol, direction, balance, scored):
             return None
 
         order_id = r['data']['orderId']
-        time.sleep(1.5)  # Attendre que la position soit ouverte
+        time.sleep(2.0)  # Attendre que la position soit ouverte
+
+        # Récupérer le vrai prix de liquidation depuis Bitget
+        real_liq = 0.0
+        tp_price_final = tp_price
+        sl_price_final = sl_price
+        try:
+            pos_data = GET('/api/v2/mix/position/all-position', {
+                'productType': 'USDT-FUTURES', 'marginCoin': 'USDT'
+            })
+            for p in (pos_data.get('data') or []):
+                if p.get('symbol') == symbol and float(p.get('total', 0)) > 0:
+                    real_liq = float(p.get('liquidationPrice', 0))
+                    log.info(f'Real liq price: {real_liq}')
+                    break
+            if real_liq > 0:
+                if direction == 'long':
+                    safe_sl = round(real_liq * 1.035, price_dec)
+                    sl_price_final = max(sl_price, safe_sl)
+                    if sl_price_final != sl_price:
+                        log.info(f'SL moved above liq: {sl_price} -> {sl_price_final}')
+                else:
+                    safe_sl = round(real_liq * 0.965, price_dec)
+                    sl_price_final = min(sl_price, safe_sl)
+                    if sl_price_final != sl_price:
+                        log.info(f'SL moved below liq: {sl_price} -> {sl_price_final}')
+        except Exception as e:
+            log.warning(f'Liq fetch failed: {e}')
 
         # ÉTAPE 2 — Poser TP/SL séparément via l'endpoint dédié
         hold_side = 'long' if direction == 'long' else 'short'
 
         tp_body = {
-            'symbol':             symbol,
-            'productType':        'USDT-FUTURES',
-            'marginCoin':         'USDT',
-            'planType':           'profit_loss',
-            'triggerPrice':       str(tp_price),
-            'triggerType':        'mark_price',
-            'executePrice':       '0',
-            'holdSide':           hold_side,
-            'size':               str(size),
-            'rangeRate':          '',
+            'symbol':        symbol,
+            'productType':   'USDT-FUTURES',
+            'marginCoin':    'USDT',
+            'planType':      'profit_loss',
+            'triggerPrice':  str(tp_price_final),
+            'triggerType':   'mark_price',
+            'executePrice':  '0',
+            'holdSide':      hold_side,
+            'size':          str(size),
+            'rangeRate':     '',
         }
         tp_r = POST('/api/v2/mix/order/place-tpsl-order', tp_body)
-        log.info(f'TP response: {tp_r}')
+        log.info(f'TP placed at {tp_price_final}: {tp_r.get("code")} {tp_r.get("msg","")}')
 
         sl_body = {
-            'symbol':             symbol,
-            'productType':        'USDT-FUTURES',
-            'marginCoin':         'USDT',
-            'planType':           'loss_plan',
-            'triggerPrice':       str(sl_price),
-            'triggerType':        'mark_price',
-            'executePrice':       '0',
-            'holdSide':           hold_side,
-            'size':               str(size),
-            'rangeRate':          '',
+            'symbol':        symbol,
+            'productType':   'USDT-FUTURES',
+            'marginCoin':    'USDT',
+            'planType':      'loss_plan',
+            'triggerPrice':  str(sl_price_final),
+            'triggerType':   'mark_price',
+            'executePrice':  '0',
+            'holdSide':      hold_side,
+            'size':          str(size),
+            'rangeRate':     '',
         }
         sl_r = POST('/api/v2/mix/order/place-tpsl-order', sl_body)
-        log.info(f'SL response: {sl_r}')
+        log.info(f'SL placed at {sl_price_final}: {sl_r.get("code")} {sl_r.get("msg","")}')
 
         if tp_r.get('code') != '00000':
             log.error(f'TP failed: {tp_r}')
@@ -665,25 +708,24 @@ def place_order(symbol, direction, balance, scored):
             log.error(f'SL failed: {sl_r}')
 
         return {
-            'orderId':      order_id,
-            'symbol':       symbol,
-            'direction':    direction,
-            'entryPrice':   price,
-            'currentPrice': price,
-            'size':         size,
-            'leverage':     lev,
-            'tp':           tp_price,
-            'sl':           sl_price,
-            'tp_pct':       round(TP_PCT * 100, 2),
-            'sl_pct':       round(SL_PCT * 100, 2),
-            'margin':       round(risk, 4),
-            'openTime':     datetime.now(timezone.utc).isoformat(),
-            'scoreAtEntry': scored['score'],
-            'reasons':      scored['reasons'],
-            'direction':    direction,
-            'unrealizedPnl':0.0,
-            'liqPrice':     0.0,
-            'totalSize':    size,
+            'orderId':       order_id,
+            'symbol':        symbol,
+            'direction':     direction,
+            'entryPrice':    price,
+            'currentPrice':  price,
+            'size':          size,
+            'leverage':      lev,
+            'tp':            tp_price_final,
+            'sl':            sl_price_final,
+            'tp_pct':        round(TP_PCT * 100, 2),
+            'sl_pct':        round(SL_PCT * 100, 2),
+            'margin':        round(risk, 4),
+            'openTime':      datetime.now(timezone.utc).isoformat(),
+            'scoreAtEntry':  scored['score'],
+            'reasons':       scored['reasons'],
+            'unrealizedPnl': 0.0,
+            'liqPrice':      real_liq,
+            'totalSize':     size,
             'trailing_active': False,
             'trailing_high':   price,
         }
