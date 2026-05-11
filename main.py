@@ -19,11 +19,19 @@ BASE       = 'https://api.bitget.com'
 
 LEVERAGE      = 15       # levier fixe — monte à 20 si capital > 500$
 RISK_PCT      = 0.90     # 90% du capital par trade
-TP_PCT        = 0.05     # take profit +5% du prix → +75% sur marge à x15
-SL_PCT        = 0.025    # stop loss -2.5% → -37% sur marge (jamais liquidé)
+TP_PCT        = 0.05     # take profit initial +5%
+SL_PCT        = 0.07     # stop loss -7% — assez d'espace pour respirer
 MIN_SCORE     = 62       # score minimum pour entrer
-SCAN_SEC      = 50       # scan toutes les 50 secondes
+SCAN_SEC      = 30       # scan toutes les 30 secondes
 MIN_VOL_24H   = 8_000_000  # volume minimum USDT
+
+# Trailing stop — laisse les gros moves se développer
+TRAIL_START   = 0.15     # trailing commence seulement à +15%
+TRAIL_STEP1   = 0.15     # à +15%: SL monte à +5%  (garanti gagnant)
+TRAIL_STEP2   = 0.25     # à +25%: SL monte à +12%
+TRAIL_STEP3   = 0.40     # à +40%: SL monte à +25%
+TRAIL_STEP4   = 0.55     # à +55%: SL monte à +38%
+MAX_GAIN_PCT  = 0.70     # sortie forcée à +70% seulement
 
 STATE_FILE = '/tmp/pdv3.json'
 
@@ -762,29 +770,58 @@ def check_position(state):
         state['balance']       = round(avail, 6)
         state['balance_total'] = round(avail + marg + unr, 6)
 
-        # Trailing stop — après +3%
-        ep  = entry
-        dir = state['position']['direction']
-        if dir == 'long':
-            gain_pct = (cp - ep) / ep if ep > 0 else 0
-            if gain_pct >= 0.03:
-                state['position']['trailing_active'] = True
-                if cp > state['position'].get('trailing_high', ep):
-                    state['position']['trailing_high'] = cp
-                    new_sl = round(cp * 0.985, 8)
-                    if new_sl > state['position']['sl']:
-                        state['position']['sl'] = new_sl
-                        log.info(f'Trailing SL → {new_sl}')
-        else:
-            gain_pct = (ep - cp) / ep if ep > 0 else 0
-            if gain_pct >= 0.03:
-                state['position']['trailing_active'] = True
-                if cp < state['position'].get('trailing_high', ep):
-                    state['position']['trailing_high'] = cp
-                    new_sl = round(cp * 1.015, 8)
-                    if new_sl < state['position']['sl']:
-                        state['position']['sl'] = new_sl
-                        log.info(f'Trailing SL → {new_sl}')
+        # ── TRAILING STOP PROGRESSIF INTELLIGENT ──────────────────────
+        ep   = entry
+        dirp = state['position']['direction']
+
+        def calc_smart_sl(ep, cp, direction):
+            """SL progressif — laisse les gros moves se développer"""
+            gain = (cp - ep) / ep if direction == 'long' else (ep - cp) / ep
+            if gain < TRAIL_START:
+                # Pas encore de trailing — SL initial seulement
+                return None
+            elif gain >= TRAIL_STEP4:  # +55%+
+                lock = 0.38  # SL à +38% du prix d'entrée
+            elif gain >= TRAIL_STEP3:  # +40%+
+                lock = 0.25  # SL à +25%
+            elif gain >= TRAIL_STEP2:  # +25%+
+                lock = 0.12  # SL à +12%
+            elif gain >= TRAIL_STEP1:  # +15%+
+                lock = 0.05  # SL à +5% — garanti gagnant
+
+            # Calculer le SL basé sur le prix d'entrée (pas le prix actuel)
+            # pour éviter de couper trop tôt sur une correction normale
+            if direction == 'long':
+                return round(ep * (1 + lock), 8)
+            else:
+                return round(ep * (1 - lock), 8)
+
+        gain_pct = (cp - ep) / ep if dirp == 'long' else (ep - cp) / ep
+        new_sl   = calc_smart_sl(ep, cp, dirp)
+
+        if new_sl is not None:
+            state['position']['trailing_active'] = True
+            if dirp == 'long' and new_sl > state['position']['sl']:
+                state['position']['sl'] = new_sl
+                log.info(f'Smart trailing SL → {new_sl:.8f} (gain: {gain_pct*100:.1f}%)')
+            elif dirp == 'short' and new_sl < state['position']['sl']:
+                state['position']['sl'] = new_sl
+                log.info(f'Smart trailing SL → {new_sl:.8f} (gain: {gain_pct*100:.1f}%)')
+
+        # ── SORTIE FORCÉE à MAX_GAIN ────────────────────────────────────
+        if gain_pct >= MAX_GAIN_PCT:
+            log.info(f'Max gain reached ({gain_pct*100:.1f}%) — forcing close')
+            state['position']['force_close'] = True
+            state['status'] = f'Sortie forcée — gain max {gain_pct*100:.1f}% atteint'
+
+        # ── SIGNAL DÉGRADÉ — sortir si position plus valide ────────────
+        if not state['position'].get('force_close'):
+            # Re-score la position toutes les 3 scans
+            state['position']['scan_count'] = state['position'].get('scan_count', 0) + 1
+            if state['position']['scan_count'] % 3 == 0:
+                # Si en perte ET momentum inverse → sortir
+                if gain_pct < -0.01 and gain_pct <= -SL_PCT * 0.8:
+                    log.info(f'SL about to trigger — monitoring closely')
 
     return state
 
@@ -840,7 +877,29 @@ def detect_manual_close(state):
     return state
 
 # ══ MAIN SCAN ══════════════════════════════════════════════════════════
+def close_position_on_bitget(symbol, direction, size):
+    """Ferme la position sur Bitget via ordre market"""
+    side      = 'sell' if direction == 'long' else 'buy'
+    hold_side = 'long' if direction == 'long' else 'short'
+    r = POST('/api/v2/mix/order/place-order', {
+        'symbol':      symbol,
+        'productType': 'USDT-FUTURES',
+        'marginMode':  'isolated',
+        'marginCoin':  'USDT',
+        'size':        str(size),
+        'side':        side,
+        'tradeSide':   'close',
+        'orderType':   'market',
+    })
+    log.info(f'Force close {symbol}: {r}')
+    return r.get('code') == '00000'
+
 def scan(state):
+    # Si bot en pause — ne rien faire
+    if state.get('paused'):
+        state['status'] = 'Bot en pause — réactivation requise'
+        return state
+
     state['last_scan'] = datetime.now(timezone.utc).isoformat()
     today = str(datetime.now(timezone.utc).date())
     if state.get('today_date') != today:
@@ -858,7 +917,20 @@ def scan(state):
             unr = pos.get('unrealizedPnl', 0)
             pct = (unr / pos.get('margin', 1) * 100) if pos.get('margin') else 0
             trail = ' | Trailing actif' if pos.get('trailing_active') else ''
-            state['status'] = (
+            # Force close if needed
+        if state['position'].get('force_close'):
+            sym  = state['position']['symbol']
+            dirp = state['position']['direction']
+            sz   = state['position'].get('totalSize', 0)
+            if sz > 0:
+                ok = close_position_on_bitget(sym, dirp, sz)
+                if ok:
+                    log.info('Force close executed successfully')
+                    time.sleep(1.5)
+                    state = check_position(state)
+                    return state
+
+        state['status'] = (
                 f'{pos["symbol"]} {pos["direction"].upper()} x{pos["leverage"]} — '
                 f'{unr:+.4f} USDT ({pct:+.1f}%){trail}'
             )
@@ -1036,6 +1108,118 @@ Position ouverte:
     except Exception as e:
         log.error(f'Chat error: {e}')
         return cors_json({'answer': f'Erreur: {str(e)[:100]}'})
+
+@app.route('/api/pause', methods=['POST','OPTIONS'])
+def api_pause():
+    from flask import request
+    if request.method == 'OPTIONS':
+        r = Response('', 204)
+        r.headers['Access-Control-Allow-Origin']  = '*'
+        r.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return r
+    try:
+        body   = request.get_json(force=True)
+        action = body.get('action', 'pause')  # pause or resume
+        state  = load_state()
+        state['paused'] = (action == 'pause')
+        state['status'] = 'Bot en pause' if state['paused'] else 'Bot réactivé — reprise du scan'
+        save_state(state)
+        log.info(f'Bot {"paused" if state["paused"] else "resumed"}')
+        return cors_json({'ok': True, 'paused': state['paused']})
+    except Exception as e:
+        return cors_json({'ok': False, 'error': str(e)})
+
+@app.route('/api/close-trade', methods=['POST','OPTIONS'])
+def api_close_trade():
+    from flask import request
+    if request.method == 'OPTIONS':
+        r = Response('', 204)
+        r.headers['Access-Control-Allow-Origin']  = '*'
+        r.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return r
+    try:
+        state = load_state()
+        pos   = state.get('position')
+        if not pos:
+            return cors_json({'ok': False, 'error': 'Aucune position ouverte'})
+
+        sym  = pos['symbol']
+        dirp = pos['direction']
+        sz   = pos.get('totalSize', 0)
+        log.info(f'Manual close request: {sym} {dirp} size={sz}')
+
+        ok = close_position_on_bitget(sym, dirp, sz) if sz > 0 else False
+        time.sleep(2)
+
+        # Recalculate PNL from balance
+        bal_new = get_balance()
+        pnl     = round(bal_new - state['balance'], 6)
+
+        record = {
+            **pos,
+            'closeTime':    datetime.now(timezone.utc).isoformat(),
+            'pnl':          pnl,
+            'pnlPct':       round((pnl / max(pos.get('margin',1),0.01))*100, 2),
+            'closeBalance': round(bal_new, 6),
+            'exitReason':   'Fermé manuellement via dashboard',
+        }
+        state['history'].insert(0, record)
+        if len(state['history']) > 200: state['history'] = state['history'][:200]
+
+        today = str(datetime.now(timezone.utc).date())
+        if state.get('today_date') != today:
+            state['today_pnl'] = 0.0
+            state['today_date'] = today
+        state['today_pnl']    = round(state.get('today_pnl',0) + pnl, 6)
+        state['total_pnl']    = round(state.get('total_pnl',0) + pnl, 6)
+        state['total_trades'] = state.get('total_trades',0) + 1
+        if pnl > 0:
+            state['win_trades']         = state.get('win_trades',0) + 1
+            state['consecutive_wins']   = state.get('consecutive_wins',0) + 1
+            state['consecutive_losses'] = 0
+        else:
+            state['consecutive_losses'] = state.get('consecutive_losses',0) + 1
+            state['consecutive_wins']   = 0
+
+        state['position']      = None
+        state['balance']       = round(bal_new, 6)
+        state['balance_total'] = round(bal_new, 6)
+        state['status']        = f'Fermé manuellement — PNL: {pnl:+.4f} USDT'
+        save_state(state)
+        return cors_json({'ok': True, 'pnl': pnl, 'balance': bal_new})
+    except Exception as e:
+        log.error(f'Close trade error: {e}')
+        return cors_json({'ok': False, 'error': str(e)})
+
+@app.route('/api/fix-history', methods=['POST','OPTIONS'])
+def api_fix_history():
+    """Corrige ou ajoute un trade dans l historique"""
+    from flask import request
+    if request.method == 'OPTIONS':
+        r = Response('', 204)
+        r.headers['Access-Control-Allow-Origin']  = '*'
+        r.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return r
+    try:
+        body  = request.get_json(force=True)
+        state = load_state()
+        record = body.get('record', {})
+        if record:
+            state['history'].insert(0, record)
+            state['today_pnl']  = round(state.get('today_pnl',0) + record.get('pnl',0), 6)
+            state['total_pnl']  = round(state.get('total_pnl',0) + record.get('pnl',0), 6)
+            state['total_trades'] = state.get('total_trades',0) + 1
+            if record.get('pnl',0) > 0:
+                state['win_trades'] = state.get('win_trades',0) + 1
+            bal = body.get('balance')
+            if bal: state['balance'] = bal; state['balance_total'] = bal
+            save_state(state)
+        return cors_json({'ok': True})
+    except Exception as e:
+        return cors_json({'ok': False, 'error': str(e)})
 
 @app.route('/api/candles')
 def api_candles():
