@@ -814,10 +814,33 @@ def check_position(state):
         if sl_updated and new_sl:
             state['position']['sl'] = new_sl
             log.info(f'Trailing SL → {new_sl} (gain: {gain_pct*100:.1f}%)')
-            # Modifier le SL sur Bitget via l'API
+            # Annuler TOUS les anciens ordres SL puis poser le nouveau
             try:
                 hold_side = 'long' if dirp == 'long' else 'short'
-                # Annuler l'ancien SL et en poser un nouveau
+
+                # Étape 1 — Récupérer tous les ordres TPSL en cours
+                existing = GET('/api/v2/mix/order/plan-delegateList', {
+                    'symbol':      sym,
+                    'productType': 'USDT-FUTURES',
+                    'planType':    'loss_plan',
+                    'status':      'live',
+                })
+                log.info(f'Existing SL orders: {existing.get("code")} count={len(existing.get("data",{}).get("entrustedList",[]))}')
+
+                # Étape 2 — Annuler chaque ordre SL existant
+                orders = existing.get('data', {}).get('entrustedList', [])
+                for order in orders:
+                    oid = order.get('orderId', '')
+                    if oid:
+                        cancel_r = POST('/api/v2/mix/order/cancel-plan-order', {
+                            'symbol':      sym,
+                            'productType': 'USDT-FUTURES',
+                            'orderId':     oid,
+                        })
+                        log.info(f'Cancelled SL order {oid}: {cancel_r.get("code")}')
+                        time.sleep(0.15)
+
+                # Étape 3 — Poser le nouveau SL
                 sl_r = POST('/api/v2/mix/order/place-tpsl-order', {
                     'symbol':       sym,
                     'productType':  'USDT-FUTURES',
@@ -829,7 +852,8 @@ def check_position(state):
                     'holdSide':     hold_side,
                     'size':         str(state['position'].get('totalSize', 0)),
                 })
-                log.info(f'SL update on Bitget: {sl_r.get("code")} {sl_r.get("msg","")}')
+                log.info(f'New SL placed at {new_sl}: {sl_r.get("code")} {sl_r.get("msg","")}')
+
             except Exception as e:
                 log.warning(f'SL update failed: {e}')
 
