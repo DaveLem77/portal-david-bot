@@ -672,40 +672,27 @@ def place_order(symbol, direction, balance, scored):
         # ÉTAPE 2 — Poser TP/SL séparément via l'endpoint dédié
         hold_side = 'long' if direction == 'long' else 'short'
 
-        tp_body = {
-            'symbol':        symbol,
-            'productType':   'USDT-FUTURES',
-            'marginCoin':    'USDT',
-            'planType':      'profit_loss',
-            'triggerPrice':  str(tp_price_final),
-            'triggerType':   'mark_price',
-            'executePrice':  '0',
-            'holdSide':      hold_side,
-            'size':          str(size),
-            'rangeRate':     '',
-        }
-        tp_r = POST('/api/v2/mix/order/place-tpsl-order', tp_body)
-        log.info(f'TP placed at {tp_price_final}: {tp_r.get("code")} {tp_r.get("msg","")}')
+        # ── PLACEMENT TP ──────────────────────────────────────────────
+        def place_tpsl(plan_type, trigger_price, label):
+            """Place un ordre TP ou SL via l'endpoint position TPSL"""
+            body = {
+                'symbol':       symbol,
+                'productType':  'USDT-FUTURES',
+                'marginCoin':   'USDT',
+                'planType':     plan_type,   # 'profit_loss' ou 'loss_plan'
+                'triggerPrice': str(round(trigger_price, price_dec)),
+                'triggerType':  'mark_price',
+                'holdSide':     hold_side,
+            }
+            r = POST('/api/v2/mix/order/place-tpsl-order', body)
+            log.info(f'{label} placed at {trigger_price}: code={r.get("code")} msg={r.get("msg","")}')
+            if r.get('code') != '00000':
+                log.error(f'{label} FAILED: {r}')
+            return r
 
-        sl_body = {
-            'symbol':        symbol,
-            'productType':   'USDT-FUTURES',
-            'marginCoin':    'USDT',
-            'planType':      'loss_plan',
-            'triggerPrice':  str(sl_price_final),
-            'triggerType':   'mark_price',
-            'executePrice':  '0',
-            'holdSide':      hold_side,
-            'size':          str(size),
-            'rangeRate':     '',
-        }
-        sl_r = POST('/api/v2/mix/order/place-tpsl-order', sl_body)
-        log.info(f'SL placed at {sl_price_final}: {sl_r.get("code")} {sl_r.get("msg","")}')
-
-        if tp_r.get('code') != '00000':
-            log.error(f'TP failed: {tp_r}')
-        if sl_r.get('code') != '00000':
-            log.error(f'SL failed: {sl_r}')
+        tp_r = place_tpsl('profit_loss', tp_price_final, 'TP')
+        time.sleep(0.3)
+        sl_r = place_tpsl('loss_plan',   sl_price_final, 'SL')
 
         return {
             'orderId':       order_id,
@@ -882,7 +869,7 @@ def check_position(state):
                         log.info(f'Cancelled SL order {oid}: {cancel_r.get("code")}')
                         time.sleep(0.15)
 
-                # Étape 3 — Poser le nouveau SL
+                # Étape 3 — Poser le nouveau SL (sans executePrice ni size inutile)
                 sl_r = POST('/api/v2/mix/order/place-tpsl-order', {
                     'symbol':       sym,
                     'productType':  'USDT-FUTURES',
@@ -890,11 +877,11 @@ def check_position(state):
                     'planType':     'loss_plan',
                     'triggerPrice': str(new_sl),
                     'triggerType':  'mark_price',
-                    'executePrice': '0',
                     'holdSide':     hold_side,
-                    'size':         str(state['position'].get('totalSize', 0)),
                 })
-                log.info(f'New SL placed at {new_sl}: {sl_r.get("code")} {sl_r.get("msg","")}')
+                log.info(f'New SL placed at {new_sl}: code={sl_r.get("code")} msg={sl_r.get("msg","")}')
+                if sl_r.get('code') != '00000':
+                    log.error(f'Trailing SL update FAILED: {sl_r}')
 
             except Exception as e:
                 log.warning(f'SL update failed: {e}')
