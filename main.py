@@ -34,6 +34,34 @@ TRAIL_STEP4   = 0.55     # à +55%: SL monte à +38%
 MAX_GAIN_PCT  = 0.70     # sortie forcée à +70% seulement
 
 STATE_FILE = '/tmp/pdv3.json'
+# ══ TWILIO SMS ════════════════════════════════════════════════════════
+TWILIO_SID   = os.environ.get('TWILIO_SID', '')
+TWILIO_TOKEN = os.environ.get('TWILIO_TOKEN', '')
+TWILIO_FROM  = '+15794851777'
+TWILIO_TO    = '+18733391815'
+
+def send_sms(msg):
+    """Envoie un SMS via Twilio"""
+    if not TWILIO_SID or not TWILIO_TOKEN:
+        log.warning('Twilio not configured — SMS skipped')
+        return
+    try:
+        import base64
+        url  = f'https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json'
+        auth = base64.b64encode(f'{TWILIO_SID}:{TWILIO_TOKEN}'.encode()).decode()
+        data = f'To={TWILIO_TO}&From={TWILIO_FROM}&Body={msg}'
+        req  = __import__('urllib.request', fromlist=['urlopen', 'Request'])
+        r    = req.urlopen(
+            req.Request(url, data=data.encode(), headers={
+                'Authorization': f'Basic {auth}',
+                'Content-Type':  'application/x-www-form-urlencoded'
+            }), timeout=10
+        )
+        log.info(f'SMS sent: {msg[:60]}')
+    except Exception as e:
+        log.warning(f'SMS failed: {e}')
+
+
 
 # ══ STATE ══════════════════════════════════════════════════════════════
 def empty_state():
@@ -949,7 +977,13 @@ def detect_manual_close(state):
         state['position']      = None
         state['balance']       = round(bal_new, 6)
         state['balance_total'] = round(bal_new, 6)
-        state['status']        = f'Fermé manuellement — PNL: {pnl:+.4f} USDT'
+        state['status']        = f'Ferme manuellement — PNL: {pnl:+.4f} USDT'
+        emoji = 'GAIN' if pnl > 0 else 'PERTE'
+        send_sms(
+            f'PORTAL DAVID - Trade ferme\n'
+            f'{emoji}: {pnl:+.4f} USDT (manuel)\n'
+            f'Nouveau solde: ${bal_new:.2f}'
+        )
         state = update_weights(state)
 
     return state
@@ -1069,6 +1103,15 @@ def scan(state):
             f'TP: +{pos["tp_pct"]}% | SL: -{pos["sl_pct"]}%'
         )
         log.info(f'Position opened: {pos["symbol"]} {pos["direction"]} x{pos["leverage"]}')
+        # SMS ouverture
+        send_sms(
+            f'PORTAL DAVID - Trade ouvert\n'
+            f'{pos["symbol"]} {pos["direction"].upper()} x{pos["leverage"]}\n'
+            f'Entree: ${pos["entryPrice"]}\n'
+            f'TP: ${pos["tp"]} (+{pos["tp_pct"]}%)\n'
+            f'SL: ${pos["sl"]}\n'
+            f'Score: {pos["scoreAtEntry"]}/100'
+        )
     else:
         state['status'] = f'Échec ordre {best["symbol"]} — prochaine tentative'
 
@@ -1264,7 +1307,13 @@ def api_close_trade():
         state['position']      = None
         state['balance']       = round(bal_new, 6)
         state['balance_total'] = round(bal_new, 6)
-        state['status']        = f'Fermé manuellement — PNL: {pnl:+.4f} USDT'
+        state['status']        = f'Ferme manuellement — PNL: {pnl:+.4f} USDT'
+        emoji = 'GAIN' if pnl > 0 else 'PERTE'
+        send_sms(
+            f'PORTAL DAVID - Trade ferme\n'
+            f'{emoji}: {pnl:+.4f} USDT (manuel)\n'
+            f'Nouveau solde: ${bal_new:.2f}'
+        )
         save_state(state)
         return cors_json({'ok': True, 'pnl': pnl, 'balance': bal_new})
     except Exception as e:
