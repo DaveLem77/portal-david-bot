@@ -630,8 +630,9 @@ def place_order(symbol, direction, balance, scored):
             min_size  = float(d.get('minTradeNum', 0.01))
             price_dec = int(d.get('pricePlace', 6))
 
-        # Taille: 70% du solde = marge garantie acceptée par Bitget
-        target_margin = balance * 0.70
+        # Taille: 40% du solde comme marge
+        # Bitget isolated exige beaucoup de buffer (fees, liquidation reserve)
+        target_margin = balance * 0.40
         notional      = target_margin * lev
         size          = notional / price
         if size_dec > 0:
@@ -723,10 +724,11 @@ def place_order(symbol, direction, balance, scored):
                 'symbol':       symbol,
                 'productType':  'USDT-FUTURES',
                 'marginCoin':   'USDT',
-                'planType':     plan_type,   # 'profit_loss' ou 'loss_plan'
+                'planType':     plan_type,   # 'profit_plan' ou 'loss_plan'
                 'triggerPrice': str(round(trigger_price, price_dec)),
                 'triggerType':  'mark_price',
                 'holdSide':     hold_side,
+                'size':         str(size),
             }
             r = POST('/api/v2/mix/order/place-tpsl-order', body)
             log.info(f'{label} placed at {trigger_price}: code={r.get("code")} msg={r.get("msg","")}')
@@ -734,9 +736,21 @@ def place_order(symbol, direction, balance, scored):
                 log.error(f'{label} FAILED: {r}')
             return r
 
-        tp_r = place_tpsl('profit_loss', tp_price_final, 'TP')
-        time.sleep(0.3)
+        tp_r = place_tpsl('profit_plan', tp_price_final, 'TP')
+        time.sleep(0.5)
         sl_r = place_tpsl('loss_plan',   sl_price_final, 'SL')
+        time.sleep(0.3)
+        # Retry si TP/SL ont échoué — critique pour la sécurité
+        if tp_r.get('code') != '00000':
+            log.warning('TP failed — retrying in 1s')
+            time.sleep(1.0)
+            tp_r2 = place_tpsl('profit_plan', tp_price_final, 'TP-retry')
+            log.info(f'TP retry: {tp_r2.get("code")}')
+        if sl_r.get('code') != '00000':
+            log.warning('SL failed — retrying in 1s')
+            time.sleep(1.0)
+            sl_r2 = place_tpsl('loss_plan', sl_price_final, 'SL-retry')
+            log.info(f'SL retry: {sl_r2.get("code")}')
 
         return {
             'orderId':       order_id,
@@ -750,7 +764,7 @@ def place_order(symbol, direction, balance, scored):
             'sl':            sl_price_final,
             'tp_pct':        round(TP_PCT * 100, 2),
             'sl_pct':        round(SL_PCT * 100, 2),
-            'margin':        round(risk, 4),
+            'margin':        round(target_margin, 4),
             'openTime':      datetime.now(timezone.utc).isoformat(),
             'scoreAtEntry':  scored['score'],
             'reasons':       scored['reasons'],
@@ -1070,6 +1084,13 @@ def scan(state):
     if bal > 0:
         state['balance'] = round(bal, 6)
         state['balance_total'] = round(bal, 6)
+
+    # VÉRIFICATION CRITIQUE: s'assurer qu'il n'y a vraiment aucune position ouverte
+    existing_pos = get_positions()
+    if existing_pos:
+        log.info(f'Position déjà ouverte sur Bitget ({existing_pos[0].get("symbol")}) — pas de nouveau trade')
+        state['status'] = f'Position active: {existing_pos[0].get("symbol")} — surveillance uniquement'
+        return state
 
     tickers = get_tickers()
     if not tickers:
