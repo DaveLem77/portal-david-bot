@@ -583,11 +583,29 @@ def place_order(symbol, direction, balance, scored):
         # Levier selon capital
         lev = 20 if balance >= 500 else 15
 
-        # Set leverage pour les deux côtés
-        set_leverage(symbol, lev, 'long')
+        # Set leverage — essayer le levier demandé, puis descendre si refus
+        def set_lev_safe(sym, target_lev, side):
+            for try_lev in [target_lev, 10, 5, 3]:
+                r = POST('/api/v2/mix/account/set-leverage', {
+                    'symbol':      sym,
+                    'productType': 'USDT-FUTURES',
+                    'marginCoin':  'USDT',
+                    'leverage':    str(try_lev),
+                    'holdSide':    side,
+                })
+                code = r.get('code', '')
+                log.info(f'SetLev {sym} x{try_lev} {side}: {code}')
+                if code == '00000':
+                    return try_lev
+                time.sleep(0.15)
+            return 3  # minimum garanti
+
+        actual_lev_l = set_lev_safe(symbol, lev, 'long')
         time.sleep(0.2)
-        set_leverage(symbol, lev, 'short')
-        time.sleep(0.3)
+        actual_lev_s = set_lev_safe(symbol, lev, 'short')
+        time.sleep(0.2)
+        lev = min(actual_lev_l, actual_lev_s)
+        log.info(f'Effective leverage: x{lev}')
 
         # Prix actuel
         tk = GET('/api/v2/mix/market/ticker', {
