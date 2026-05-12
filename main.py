@@ -784,6 +784,7 @@ def check_position(state):
     if not state['position']:
         return state
 
+    log.info(f'Checking position: {state["position"]["symbol"]}')
     positions = get_positions()
     sym  = state['position']['symbol']
     pos  = next((p for p in positions if p['symbol'] == sym), None)
@@ -1085,11 +1086,35 @@ def scan(state):
         state['balance'] = round(bal, 6)
         state['balance_total'] = round(bal, 6)
 
-    # VÉRIFICATION CRITIQUE: s'assurer qu'il n'y a vraiment aucune position ouverte
+    # Si position dans l'état — surveiller et ajuster SL/trailing
+    if state.get('position'):
+        state = check_position(state)
+        return state
+
+    # Vérifier si position ouverte sur Bitget mais pas dans l'état
     existing_pos = get_positions()
     if existing_pos:
-        log.info(f'Position déjà ouverte sur Bitget ({existing_pos[0].get("symbol")}) — pas de nouveau trade')
-        state['status'] = f'Position active: {existing_pos[0].get("symbol")} — surveillance uniquement'
+        sym = existing_pos[0].get('symbol', '')
+        log.info(f'Position Bitget détectée ({sym}) sans état — sync')
+        p   = existing_pos[0]
+        ep  = float(p.get('openPriceAvg', 0))
+        lev = int(float(p.get('leverage', 15)))
+        mg  = float(p.get('marginSize', 0))
+        sz  = float(p.get('total', 0))
+        hld = p.get('holdSide', 'long')
+        dirp = 'long' if hld == 'long' else 'short'
+        state['position'] = {
+            'symbol': sym, 'direction': dirp,
+            'entryPrice': ep, 'currentPrice': ep,
+            'tp': round(ep*(1+TP_PCT) if dirp=='long' else ep*(1-TP_PCT), 8),
+            'sl': round(ep*(1-SL_PCT) if dirp=='long' else ep*(1+SL_PCT), 8),
+            'leverage': lev, 'margin': mg, 'liqPrice': float(p.get('liquidationPrice',0)),
+            'totalSize': sz, 'unrealizedPnl': float(p.get('unrealizedPL',0)),
+            'scoreAtEntry': 60, 'reasons': ['Sync Bitget'],
+            'openTime': '', 'trailing_active': False, 'trailing_high': ep,
+            'tp_pct': TP_PCT*100, 'sl_pct': SL_PCT*100,
+        }
+        state = check_position(state)
         return state
 
     tickers = get_tickers()
