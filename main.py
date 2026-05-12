@@ -630,19 +630,17 @@ def place_order(symbol, direction, balance, scored):
             min_size  = float(d.get('minTradeNum', 0.01))
             price_dec = int(d.get('pricePlace', 6))
 
-        # Taille position — marge réelle = balance × RISK_PCT
-        # La taille en contrats = (marge × levier) / prix
-        # On limite à 85% pour laisser de la marge de frais
-        risk  = balance * min(RISK_PCT, 0.85)
-        size  = (risk * lev) / price
-        size  = max(size, min_size)
-        # Arrondir vers le bas pour ne jamais dépasser
+        # Taille: 70% du solde = marge garantie acceptée par Bitget
+        target_margin = balance * 0.70
+        notional      = target_margin * lev
+        size          = notional / price
         if size_dec > 0:
             size = math.floor(size * (10**size_dec)) / (10**size_dec)
         else:
             size = math.floor(size)
         size = max(size, min_size)
-        log.info(f'Size calc: balance={balance} risk={risk:.4f} lev={lev} price={price} size={size}')
+        actual_margin = (size * price) / lev
+        log.info(f'Size calc: balance={balance:.2f} margin={actual_margin:.2f} ({actual_margin/balance*100:.1f}%) size={size}')
 
         # TP et SL — prix absolus arrondis correctement
         def rnd(p):
