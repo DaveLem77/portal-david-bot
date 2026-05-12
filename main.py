@@ -17,20 +17,20 @@ SECRET_KEY = os.environ.get('BITGET_SECRET_KEY', '')
 PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', '')
 BASE       = 'https://api.bitget.com'
 
-LEVERAGE      = 15       # levier fixe — monte à 20 si capital > 500$
-RISK_PCT      = 0.90     # 90% du capital par trade
-TP_PCT        = 0.05     # take profit initial +5%
-SL_PCT        = 0.07     # stop loss -7% — assez d'espace pour respirer
+LEVERAGE      = 15       # levier de base (sera overridé dynamiquement)
+RISK_PCT      = 0.60     # 60% du capital par trade (base)
+TP_PCT        = 0.04     # take profit +4% — plus réaliste
+SL_PCT        = 0.035    # stop loss -3.5% — sécuritaire avec x15 (liq à ~6.5%)
 MIN_SCORE     = 62       # score minimum pour entrer
 SCAN_SEC      = 30       # scan toutes les 30 secondes
 MIN_VOL_24H   = 8_000_000  # volume minimum USDT
 
 # Trailing stop — laisse les gros moves se développer
-TRAIL_START   = 0.15     # trailing commence seulement à +15%
-TRAIL_STEP1   = 0.15     # à +15%: SL monte à +5%  (garanti gagnant)
-TRAIL_STEP2   = 0.25     # à +25%: SL monte à +12%
-TRAIL_STEP3   = 0.40     # à +40%: SL monte à +25%
-TRAIL_STEP4   = 0.55     # à +55%: SL monte à +38%
+TRAIL_START   = 0.05     # trailing commence à +5%
+TRAIL_STEP1   = 0.05     # à +5%:  SL monte à breakeven
+TRAIL_STEP2   = 0.10     # à +10%: SL monte à +4%
+TRAIL_STEP3   = 0.20     # à +20%: SL monte à +12%
+TRAIL_STEP4   = 0.35     # à +35%: SL monte à +25%
 MAX_GAIN_PCT  = 0.70     # sortie forcée à +70% seulement
 
 STATE_FILE = '/tmp/pdv3.json'
@@ -578,14 +578,42 @@ def set_leverage(symbol, lev, side):
     return r.get('code') == '00000'
 
 # ══ PLACE ORDER ═══════════════════════════════════════════════════════
-def place_order(symbol, direction, balance, scored):
+def place_order(symbol, direction, balance, scored, state_balance_info=None):
     try:
         # Levier selon capital
         lev = 20 if balance >= 500 else 15
 
+        # Levier dynamique basé sur le score
+        score = scored.get('score', 62)
+        consensus = scored.get('consensus_boost', False)
+
+        if score >= 90:   base_lev = 25
+        elif score >= 80: base_lev = 20
+        elif score >= 70: base_lev = 15
+        else:             base_lev = 10
+
+        # Bonus consensus marché
+        if consensus:
+            base_lev = min(25, int(base_lev * 1.25))
+            log.info(f'Consensus boost: levier -> x{base_lev}')
+
+        # Marge dynamique selon pertes consécutives
+        consec_losses = state_balance_info.get('consecutive_losses', 0) if state_balance_info else 0
+        if consec_losses >= 2:
+            risk_pct = 0.25
+            log.info(f'Mode survie: 2 pertes consecutives -> marge 25%')
+        elif consec_losses == 1:
+            risk_pct = 0.40
+            log.info(f'Mode prudent: 1 perte -> marge 40%')
+        else:
+            risk_pct = RISK_PCT  # 60%
+
+        lev = base_lev
+        log.info(f'Score={score} -> levier x{lev} marge={risk_pct*100:.0f}%')
+
         # Set leverage — essayer le levier demandé, puis descendre si refus
         def set_lev_safe(sym, target_lev, side):
-            for try_lev in [target_lev, 10, 5, 3]:
+            for try_lev in [target_lev, int(target_lev*0.75), 10, 5]:
                 r = POST('/api/v2/mix/account/set-leverage', {
                     'symbol':      sym,
                     'productType': 'USDT-FUTURES',
@@ -598,7 +626,7 @@ def place_order(symbol, direction, balance, scored):
                 if code == '00000':
                     return try_lev
                 time.sleep(0.15)
-            return 3  # minimum garanti
+            return 5
 
         actual_lev_l = set_lev_safe(symbol, lev, 'long')
         time.sleep(0.2)
@@ -866,15 +894,16 @@ def check_position(state):
         gain_pct = (cp - ep) / ep if dirp == 'long' else (ep - cp) / ep
         sl_updated = False
         new_sl = None
+        log.info(f'Position monitor: {sym} ep={ep} cp={cp} gain={gain_pct*100:.2f}% liq={liq}')
 
-        if gain_pct >= TRAIL_STEP4:       # +55%+  → lock +38%
-            lock = 0.38
-        elif gain_pct >= TRAIL_STEP3:      # +40%+  → lock +25%
+        if gain_pct >= TRAIL_STEP4:       # +35%+ → lock +25%
             lock = 0.25
-        elif gain_pct >= TRAIL_STEP2:      # +25%+  → lock +12%
+        elif gain_pct >= TRAIL_STEP3:      # +20%+ → lock +12%
             lock = 0.12
-        elif gain_pct >= TRAIL_STEP1:      # +15%+  → lock +5%
-            lock = 0.05
+        elif gain_pct >= TRAIL_STEP2:      # +10%+ → lock +4%
+            lock = 0.04
+        elif gain_pct >= TRAIL_STEP1:      # +5%+  → lock breakeven (+0.5%)
+            lock = 0.005
         else:
             lock = None  # pas encore de trailing
 
@@ -1153,11 +1182,19 @@ def scan(state):
         return state
 
     best = sorted(candidates, key=lambda x: x['score'], reverse=True)[0]
-    log.info(f'Best: {best["symbol"]} score={best["score"]} dir={best["direction"]}')
 
+    # Détection consensus — combien de cryptos vont dans la même direction?
+    same_dir = [c for c in candidates if c['direction'] == best['direction']]
+    consensus = len(same_dir) >= 3
+    best['consensus_boost'] = consensus
+    if consensus:
+        log.info(f'Consensus détecté: {len(same_dir)} cryptos en {best["direction"]} — boost levier')
+
+    log.info(f'Best: {best["symbol"]} score={best["score"]} dir={best["direction"]} consensus={consensus}')
     state['status'] = f'Signal: {best["symbol"]} {best["direction"].upper()} score={best["score"]} — Ouverture…'
 
-    pos = place_order(best['symbol'], best['direction'], state['balance'], best)
+    pos = place_order(best['symbol'], best['direction'], state['balance'], best,
+                      state_balance_info={'consecutive_losses': state.get('consecutive_losses', 0)})
     if pos:
         state['position'] = pos
         state['status'] = (
