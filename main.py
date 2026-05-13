@@ -1,4 +1,3 @@
-
 """
 Portal David — Bitget Futures Bot v3
 TP/SL fiables, levier x15-20, vise 3-8% de move = 45-160% sur marge
@@ -398,7 +397,7 @@ def vol_spike(candles, n=20):
     return vols[-1] / avg if avg > 0 else 1.0
 
 # ══ SCORING ════════════════════════════════════════════════════════════
-def score_token(ticker, c1m, c5m, c15m, c1h, weights):
+def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
     try:
         price  = float(ticker.get('lastPr', 0))
         vol24  = float(ticker.get('usdtVolume', 0))
@@ -412,6 +411,7 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights):
         def cl(c): return [float(x[4]) for x in c] if c else []
         cl1m  = cl(c1m);  cl5m = cl(c5m)
         cl15m = cl(c15m); cl1h = cl(c1h)
+        cl4h  = cl(c4h) if c4h else cl1h
 
         score = 0
         direction = 'long'
@@ -442,18 +442,33 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights):
         if direction == 'long'  and r15m < 48: score += 8 * w_rsi
         elif direction == 'short' and r15m > 52: score += 8 * w_rsi
 
-        # ── CONFIRMATION TENDANCE 1H — critique anti-faux-signal ─────
+        # ── CONFIRMATION TENDANCE 1H et 4H — filtre anti-contre-tendance ──
         r1h = rsi(cl1h)
-        if direction == 'long'  and r1h > 60:
-            score -= 20  # RSI 1h en surachat — contre-tendance dangereux
-            reasons.append(f'ATTENTION: RSI 1h={r1h:.0f} surachat')
-        elif direction == 'short' and r1h < 40:
-            score -= 20  # RSI 1h en survente — contre-tendance dangereux
-            reasons.append(f'ATTENTION: RSI 1h={r1h:.0f} survente')
-        elif direction == 'long'  and r1h < 55:
-            score += 10  # Tendance 1h confirmée pour long
-        elif direction == 'short' and r1h > 45:
-            score += 10  # Tendance 1h confirmée pour short
+        if direction == 'long'  and r1h > 65:
+            score -= 25
+            reasons.append(f'DANGER: RSI 1h={r1h:.0f} surachat — contre-tendance')
+        elif direction == 'short' and r1h < 35:
+            score -= 25
+            reasons.append(f'DANGER: RSI 1h={r1h:.0f} survente — contre-tendance')
+        elif direction == 'long'  and r1h < 50:
+            score += 12
+            reasons.append(f'RSI 1h={r1h:.0f} confirme long')
+        elif direction == 'short' and r1h > 50:
+            score += 12
+            reasons.append(f'RSI 1h={r1h:.0f} confirme short')
+
+        # ── FILTRE 4H — tendance majeure obligatoire ─────────────────
+        r4h = rsi(cl4h)
+        if direction == 'long' and r4h > 70:
+            score -= 30  # Marché surachat sur 4h — short squeeze probable
+            reasons.append(f'BLOQUE: RSI 4h={r4h:.0f} surachat majeur')
+        elif direction == 'short' and r4h < 30:
+            score -= 30  # Marché survente sur 4h — rebond probable
+            reasons.append(f'BLOQUE: RSI 4h={r4h:.0f} survente majeure')
+        elif direction == 'long' and r4h < 60:
+            score += 8   # Tendance 4h favorable au long
+        elif direction == 'short' and r4h > 40:
+            score += 8   # Tendance 4h favorable au short
 
         # ── MACD ─────────────────────────────────── w=1.0
         w_macd = weights.get('macd', 1.0)
@@ -774,38 +789,78 @@ def place_order(symbol, direction, balance, scored, state_balance_info=None):
 
         # ── PLACEMENT TP ──────────────────────────────────────────────
         def place_tpsl(plan_type, trigger_price, label):
-            """Place un ordre TP ou SL via l'endpoint position TPSL"""
+            """Place un ordre TP ou SL — essaie les deux formats Bitget"""
+            # Format 1: avec size (requis par certaines versions API)
             body = {
                 'symbol':       symbol,
                 'productType':  'USDT-FUTURES',
                 'marginCoin':   'USDT',
-                'planType':     plan_type,   # 'profit_plan' ou 'loss_plan'
+                'planType':     plan_type,
                 'triggerPrice': str(round(trigger_price, price_dec)),
                 'triggerType':  'mark_price',
                 'holdSide':     hold_side,
                 'size':         str(size),
             }
             r = POST('/api/v2/mix/order/place-tpsl-order', body)
-            log.info(f'{label} placed at {trigger_price}: code={r.get("code")} msg={r.get("msg","")}')
-            if r.get('code') != '00000':
-                log.error(f'{label} FAILED: {r}')
-            return r
+            log.info(f'{label} at {trigger_price}: code={r.get("code")} msg={r.get("msg","")}')
+            if r.get('code') == '00000':
+                return r
+            log.error(f'{label} format1 FAILED: {r}')
+
+            # Format 2: sans size
+            time.sleep(0.3)
+            body2 = {k: v for k, v in body.items() if k != 'size'}
+            r2 = POST('/api/v2/mix/order/place-tpsl-order', body2)
+            log.info(f'{label} format2: code={r2.get("code")} msg={r2.get("msg","")}')
+            if r2.get('code') == '00000':
+                return r2
+            log.error(f'{label} format2 FAILED: {r2}')
+
+            # Format 3: endpoint alternatif place-plan-order
+            time.sleep(0.3)
+            body3 = {
+                'symbol':       symbol,
+                'productType':  'USDT-FUTURES',
+                'marginCoin':   'USDT',
+                'planType':     plan_type,
+                'triggerPrice': str(round(trigger_price, price_dec)),
+                'triggerType':  'mark_price',
+                'side':         'buy' if (plan_type == 'loss_plan' and hold_side == 'short') or (plan_type == 'profit_plan' and hold_side == 'long') else 'sell',
+                'tradeSide':    'close',
+                'size':         str(size),
+                'orderType':    'market',
+            }
+            r3 = POST('/api/v2/mix/order/place-plan-order', body3)
+            log.info(f'{label} format3 plan-order: code={r3.get("code")} msg={r3.get("msg","")}')
+            return r3
 
         tp_r = place_tpsl('profit_plan', tp_price_final, 'TP')
         time.sleep(0.5)
-        sl_r = place_tpsl('loss_plan',   sl_price_final, 'SL')
-        time.sleep(0.3)
-        # Retry si TP/SL ont échoué — critique pour la sécurité
+        sl_r = place_tpsl('loss_plan', sl_price_final, 'SL')
+        time.sleep(0.5)
+
+        # Retry TP/SL si echec — avec log complet pour debug
         if tp_r.get('code') != '00000':
-            log.warning('TP failed — retrying in 1s')
-            time.sleep(1.0)
+            log.error(f'TP FAILED full response: {tp_r}')
+            time.sleep(1.5)
             tp_r2 = place_tpsl('profit_plan', tp_price_final, 'TP-retry')
-            log.info(f'TP retry: {tp_r2.get("code")}')
+            log.info(f'TP retry: code={tp_r2.get("code")} msg={tp_r2.get("msg","")}')
         if sl_r.get('code') != '00000':
-            log.warning('SL failed — retrying in 1s')
-            time.sleep(1.0)
-            sl_r2 = place_tpsl('loss_plan', sl_price_final, 'SL-retry')
-            log.info(f'SL retry: {sl_r2.get("code")}')
+            log.error(f'SL FAILED full response: {sl_r}')
+            # Essayer sans size
+            time.sleep(1.5)
+            r_nosize = POST('/api/v2/mix/order/place-tpsl-order', {
+                'symbol':       symbol,
+                'productType':  'USDT-FUTURES',
+                'marginCoin':   'USDT',
+                'planType':     'loss_plan',
+                'triggerPrice': str(round(sl_price_final, price_dec)),
+                'triggerType':  'mark_price',
+                'holdSide':     hold_side,
+            })
+            log.info(f'SL retry without size: code={r_nosize.get("code")} msg={r_nosize.get("msg","")}')
+            if r_nosize.get('code') != '00000':
+                log.error(f'SL COMPLETELY FAILED — position sans SL!')
 
         return {
             'orderId':       order_id,
@@ -1104,6 +1159,13 @@ def scan(state):
     state['_scan_count'] = state.get('_scan_count', 0) + 1
     if state['_scan_count'] % 120 == 0:
         state['cad_rate'] = fetch_cad_rate()
+
+    # Warmup — attendre 6 scans (3 min) avant de trader après un redémarrage
+    # Évite d'ouvrir un trade immédiatement sur données insuffisantes
+    if state['_scan_count'] < 6:
+        state['status'] = f'Warmup… ({state["_scan_count"]}/6 scans)'
+        log.info(f'Warmup scan {state["_scan_count"]}/6 — pas de trade encore')
+        return state
     today = str(datetime.now(timezone.utc).date())
     if state.get('today_date') != today:
         state['today_pnl'] = 0.0
@@ -1202,8 +1264,8 @@ def scan(state):
         c5m  = get_candles(sym, '5m', 100); time.sleep(0.07)
         c15m = get_candles(sym, '15m', 60); time.sleep(0.07)
         c1h  = get_candles(sym, '1H', 50);  time.sleep(0.07)
-
-        res = score_token(tk, c1m, c5m, c15m, c1h, weights)
+        c4h  = get_candles(sym, '4H', 30);  time.sleep(0.07)
+        res = score_token(tk, c1m, c5m, c15m, c1h, weights, c4h)
         if res and res['score'] >= MIN_SCORE:
             candidates.append({'symbol': sym, **res})
             log.info(f'Candidate: {sym} score={res["score"]} dir={res["direction"]}')
