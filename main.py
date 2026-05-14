@@ -46,6 +46,119 @@ def fetch_cad_rate():
     except:
         return 1.3650  # fallback
 
+
+# ══ IA DE TRADING — CERVEAU DU BOT ══════════════════════════════════════
+import urllib.request as _ur
+import json as _json
+
+def ai_trade_decision(state, candles_1m, rsi_vals, macd_val, btc_change, context='entry'):
+    """
+    Appelle Claude pour une décision de trading en temps réel.
+    context = 'entry' (valider avant d'entrer) ou 'manage' (gérer position en cours)
+    Retourne dict: {action, reason, new_sl, new_tp, confidence}
+    """
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '')
+    if not api_key:
+        return {'action': 'HOLD', 'reason': 'No API key', 'confidence': 50}
+
+    pos = state.get('position')
+    bal = state.get('balance_total', 0)
+
+    # Résumé des bougies récentes
+    last_candles = candles_1m[-15:] if candles_1m else []
+    cdl_summary = []
+    for c in last_candles:
+        try:
+            o,h,l,cl = float(c[1]),float(c[2]),float(c[3]),float(c[4])
+            cdl_summary.append({'o':round(o,6),'h':round(h,6),'l':round(l,6),'c':round(cl,6)})
+        except: pass
+
+    if context == 'entry':
+        prompt = f"""Tu es un expert en trading de futures crypto avec 20 ans d'expérience.
+
+SIGNAL DÉTECTÉ:
+- Symbole: {state.get('_pending_symbol','?')}
+- Direction proposée: {state.get('_pending_dir','?')}
+- Score algorithme: {state.get('_pending_score','?')}/100
+- RSI 1m/5m/15m: {rsi_vals}
+- MACD: {macd_val}
+- BTC variation 1h: {btc_change}%
+- Solde: ${bal:.2f}
+- 15 dernières bougies 1m: {cdl_summary}
+
+DÉCIDE: Est-ce un bon trade à prendre RIGHT NOW?
+
+Réponds UNIQUEMENT en JSON valide:
+{{"action":"ENTER" ou "SKIP","reason":"explication courte en français","confidence":0-100}}
+
+ENTER = signal solide, momentum favorable, tendance confirmée
+SKIP = signal faible, contre-tendance, momentum douteux"""
+
+    else:  # manage
+        if not pos:
+            return {'action': 'HOLD', 'reason': 'No position', 'confidence': 50}
+        ep = pos.get('entryPrice', 0)
+        cp = pos.get('currentPrice', ep)
+        dirp = pos.get('direction', 'long')
+        gain = (cp-ep)/ep*100 if dirp=='long' else (ep-cp)/ep*100
+        lev = pos.get('leverage', 15)
+        sl = pos.get('sl', 0)
+        tp = pos.get('tp', 0)
+        liq = pos.get('liqPrice', 0)
+        gain_on_margin = gain * lev
+
+        prompt = f"""Tu es le meilleur trader de futures crypto au monde. Ta mission ABSOLUE: protéger le capital et maximiser les gains.
+
+POSITION EN COURS:
+Symbole: {pos.get('symbol')} | Direction: {dirp.upper()} | Levier: x{lev}
+Entrée: ${ep:.6f} | Prix actuel: ${cp:.6f}
+Gain sur prix: {gain:+.3f}% | Gain sur marge: {gain_on_margin:+.1f}%
+SL: ${sl:.6f} | TP: ${tp:.6f} | Liquidation: ${liq:.6f}
+RSI 1m/5m/15m: {rsi_vals} | MACD: {macd_val} | BTC 1h: {btc_change:+.2f}%
+Dernières bougies 1m: {cdl_summary}
+
+RÈGLES ABSOLUES:
+1. JAMAIS laisser un gain de +3%+ se transformer en perte — monte le SL immédiatement
+2. Si 3 bougies consécutives vont CONTRE la position → EXIT_NOW sans hésiter
+3. Si momentum très fort ET RSI pas encore extrême → MOVE_TP pour laisser courir
+4. Vaut TOUJOURS mieux +0.3% que -3.5% — la préservation du capital prime
+5. Si BTC chute fort et on est long → EXIT_NOW immédiatement
+6. Si RSI 1m dépasse 75 en short ou passe sous 25 en long → vérifier momentum
+
+DÉCIDE maintenant. JSON uniquement:
+{{"action":"HOLD ou EXIT_NOW ou MOVE_SL ou MOVE_TP ou MOVE_BOTH","reason":"courte raison précise","new_sl":null_ou_float,"new_tp":null_ou_float,"confidence":0-100}}"""
+
+    try:
+        body = _json.dumps({
+            'model': 'claude-sonnet-4-20250514',
+            'max_tokens': 150,
+            'messages': [{'role': 'user', 'content': prompt}]
+        }).encode()
+
+        req = _ur.Request(
+            'https://api.anthropic.com/v1/messages',
+            data=body,
+            headers={
+                'x-api-key': api_key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            }
+        )
+        with _ur.urlopen(req, timeout=8) as resp:
+            data = _json.loads(resp.read())
+            text = data['content'][0]['text'].strip()
+            # Extract JSON
+            import re as _re
+            m = _re.search(r'\{.*?\}', text, _re.DOTALL)
+            if m:
+                result = _json.loads(m.group())
+                log.info(f'AI decision [{context}]: {result.get("action")} — {result.get("reason","")} (conf={result.get("confidence")})')
+                return result
+    except Exception as e:
+        log.warning(f'AI decision failed: {e}')
+
+    return {'action': 'HOLD' if context=='manage' else 'ENTER', 'reason': 'AI unavailable', 'confidence': 60}
+
 STATE_FILE = '/tmp/pdv4.json'  # v4 — nouveau départ 175$
 # ══ TWILIO SMS ════════════════════════════════════════════════════════
 TWILIO_SID   = os.environ.get('TWILIO_SID', '')
@@ -397,173 +510,332 @@ def vol_spike(candles, n=20):
     return vols[-1] / avg if avg > 0 else 1.0
 
 # ══ SCORING ════════════════════════════════════════════════════════════
+
+def get_liquidations(symbol):
+    """Récupère les liquidations récentes — signal de retournement puissant"""
+    try:
+        r = GET('/api/v2/mix/market/liquidation-orders', {
+            'symbol': symbol,
+            'productType': 'USDT-FUTURES',
+        })
+        longs = 0; shorts = 0
+        for item in (r.get('data') or []):
+            side = item.get('side','')
+            usd  = float(item.get('fillUsdtValue', 0))
+            if side in ('sell','short'):  # long liquidé = vente forcée
+                longs  += usd
+            elif side in ('buy','long'):  # short liquidé = achat forcé
+                shorts += usd
+        return {'long_usd': longs, 'short_usd': shorts}
+    except:
+        return None
+
 def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
+    """
+    Moteur de scoring v5 — 12 signaux dont 4 jamais utilisés dans les bots publics.
+    Score 0-100. Direction déterminée par consensus pondéré.
+    """
     try:
         price  = float(ticker.get('lastPr', 0))
         vol24  = float(ticker.get('usdtVolume', 0))
         chg24  = float(ticker.get('change24h', 0)) * 100
         high24 = float(ticker.get('high24h', price))
         low24  = float(ticker.get('low24h', price))
+        sym    = ticker.get('symbol', '')
 
         if price <= 0 or vol24 < MIN_VOL_24H:
             return None
 
         def cl(c): return [float(x[4]) for x in c] if c else []
+        def hi(c): return [float(x[2]) for x in c] if c else []
+        def lo(c): return [float(x[3]) for x in c] if c else []
+        def vo(c): return [float(x[5]) for x in c] if c else []
+
         cl1m  = cl(c1m);  cl5m = cl(c5m)
         cl15m = cl(c15m); cl1h = cl(c1h)
         cl4h  = cl(c4h) if c4h else cl1h
+        hi5m  = hi(c5m);  lo5m = lo(c5m)
+        vo5m  = vo(c5m);  vo1m = vo(c1m)
 
-        score = 0
-        direction = 'long'
-        reasons = []
+        long_pts = 0   # points favorables au LONG
+        short_pts = 0  # points favorables au SHORT
+        reasons_long  = []
+        reasons_short = []
 
-        # ── RSI ──────────────────────────────────── w=1.0
-        w_rsi = weights.get('rsi', 1.0)
+        # ── 1. RSI MULTI-TIMEFRAME (max 30 pts) ─────────────────────────
         r1m  = rsi(cl1m)
         r5m  = rsi(cl5m)
         r15m = rsi(cl15m)
+        r1h  = rsi(cl1h)
+        r4h  = rsi(cl4h)
 
-        if r1m < 28 and r5m < 32:
-            score += 28 * w_rsi; direction = 'long'
-            reasons.append(f'RSI très survendu 1m:{r1m:.0f} 5m:{r5m:.0f}')
-        elif r1m < 35 and r5m < 40:
-            score += 18 * w_rsi; direction = 'long'
-            reasons.append(f'RSI survendu 1m:{r1m:.0f}')
-        elif r1m > 72 and r5m > 68:
-            score += 28 * w_rsi; direction = 'short'
-            reasons.append(f'RSI surachat 1m:{r1m:.0f} 5m:{r5m:.0f}')
-        elif r1m > 65 and r5m > 62:
-            score += 18 * w_rsi; direction = 'short'
-            reasons.append(f'RSI surachat 1m:{r1m:.0f}')
-        elif 42 <= r5m <= 58:
-            score += 8 * w_rsi
+        # RSI 1m + 5m survente cascade → long puissant
+        if r1m < 25 and r5m < 30:
+            long_pts += 30; reasons_long.append(f'RSI cascade survente {r1m:.0f}/{r5m:.0f}')
+        elif r1m < 32 and r5m < 38:
+            long_pts += 20; reasons_long.append(f'RSI survendu {r1m:.0f}/{r5m:.0f}')
+        elif r1m < 40:
+            long_pts += 10
 
-        # Alignement 15m
-        if direction == 'long'  and r15m < 48: score += 8 * w_rsi
-        elif direction == 'short' and r15m > 52: score += 8 * w_rsi
+        if r1m > 75 and r5m > 70:
+            short_pts += 30; reasons_short.append(f'RSI cascade surachat {r1m:.0f}/{r5m:.0f}')
+        elif r1m > 68 and r5m > 62:
+            short_pts += 20; reasons_short.append(f'RSI surachat {r1m:.0f}/{r5m:.0f}')
+        elif r1m > 60:
+            short_pts += 10
 
-        # ── CONFIRMATION TENDANCE 1H et 4H — filtre anti-contre-tendance ──
-        r1h = rsi(cl1h)
-        if direction == 'long'  and r1h > 65:
-            score -= 25
-            reasons.append(f'DANGER: RSI 1h={r1h:.0f} surachat — contre-tendance')
-        elif direction == 'short' and r1h < 35:
-            score -= 25
-            reasons.append(f'DANGER: RSI 1h={r1h:.0f} survente — contre-tendance')
-        elif direction == 'long'  and r1h < 50:
-            score += 12
-            reasons.append(f'RSI 1h={r1h:.0f} confirme long')
-        elif direction == 'short' and r1h > 50:
-            score += 12
-            reasons.append(f'RSI 1h={r1h:.0f} confirme short')
+        # Confirmation 15m
+        if r15m < 45: long_pts  += 8
+        if r15m > 55: short_pts += 8
 
-        # ── FILTRE 4H — tendance majeure obligatoire ─────────────────
-        r4h = rsi(cl4h)
-        if direction == 'long' and r4h > 70:
-            score -= 30  # Marché surachat sur 4h — short squeeze probable
-            reasons.append(f'BLOQUE: RSI 4h={r4h:.0f} surachat majeur')
-        elif direction == 'short' and r4h < 30:
-            score -= 30  # Marché survente sur 4h — rebond probable
-            reasons.append(f'BLOQUE: RSI 4h={r4h:.0f} survente majeure')
-        elif direction == 'long' and r4h < 60:
-            score += 8   # Tendance 4h favorable au long
-        elif direction == 'short' and r4h > 40:
-            score += 8   # Tendance 4h favorable au short
+        # FILTRE TENDANCE 1H obligatoire — anti contre-tendance
+        if r1h > 68:   long_pts  -= 20  # surachat 1h → danger long
+        elif r1h < 50: long_pts  += 10
+        if r1h < 32:   short_pts -= 20  # survente 1h → danger short
+        elif r1h > 50: short_pts += 10
 
-        # ── MACD ─────────────────────────────────── w=1.0
-        w_macd = weights.get('macd', 1.0)
+        # FILTRE 4H — tendance majeure
+        if r4h > 72:   long_pts  -= 25
+        elif r4h < 55: long_pts  += 8
+        if r4h < 28:   short_pts -= 25
+        elif r4h > 45: short_pts += 8
+
+        # ── 2. MACD MOMENTUM (max 20 pts) ───────────────────────────────
+        mh1m  = macd_hist(cl1m)
         mh5m  = macd_hist(cl5m)
         mh15m = macd_hist(cl15m)
-        if direction == 'long':
-            if mh5m > 0 and mh15m > 0:
-                score += 20 * w_macd
-                reasons.append('MACD haussier aligné 5m+15m')
-            elif mh5m > 0: score += 10 * w_macd
-        else:
-            if mh5m < 0 and mh15m < 0:
-                score += 20 * w_macd
-                reasons.append('MACD baissier aligné 5m+15m')
-            elif mh5m < 0: score += 10 * w_macd
 
-        # ── VOLUME SPIKE ─────────────────────────── w=1.0
-        w_vol = weights.get('volume', 1.0)
+        # Croisement MACD 1m qui confirme 5m
+        if mh1m > 0 and mh5m > 0 and mh15m > 0:
+            long_pts += 20; reasons_long.append('MACD haussier aligné 1m+5m+15m')
+        elif mh1m > 0 and mh5m > 0:
+            long_pts += 12
+        elif mh1m > 0:
+            long_pts += 6
+
+        if mh1m < 0 and mh5m < 0 and mh15m < 0:
+            short_pts += 20; reasons_short.append('MACD baissier aligné 1m+5m+15m')
+        elif mh1m < 0 and mh5m < 0:
+            short_pts += 12
+        elif mh1m < 0:
+            short_pts += 6
+
+        # ── 3. VOLUME ANOMALY DETECTION (max 18 pts) ────────────────────
+        # Signal original: détecter l'accumulation silencieuse
+        # Volume croissant sur 3 bougies = gros acteur qui rentre
         vs = vol_spike(c5m)
         if vs > 5:
-            score += 18 * w_vol
-            reasons.append(f'Volume x{vs:.1f} — activité massive')
-        elif vs > 3: score += 12 * w_vol; reasons.append(f'Volume x{vs:.1f}')
-        elif vs > 2: score += 7 * w_vol
-        elif vs < 0.5: score -= 8
+            # Volume explosif — direction du mouvement associé
+            if len(cl5m) >= 2 and cl5m[-1] > cl5m[-2]:
+                long_pts  += 18; reasons_long.append(f'Volume x{vs:.1f} avec hausse prix')
+            else:
+                short_pts += 18; reasons_short.append(f'Volume x{vs:.1f} avec baisse prix')
+        elif vs > 3:
+            if len(cl5m) >= 2 and cl5m[-1] > cl5m[-2]:
+                long_pts  += 12
+            else:
+                short_pts += 12
+        elif vs > 1.8:
+            if len(cl5m) >= 2 and cl5m[-1] > cl5m[-2]:
+                long_pts  += 6
+            else:
+                short_pts += 6
+        elif vs < 0.4:
+            long_pts  -= 8  # volume mort — éviter
+            short_pts -= 8
 
-        # ── BREAKOUT ─────────────────────────────── w=1.0
-        w_bo = weights.get('breakout', 1.0)
+        # ── 4. MOMENTUM ACCÉLÉRATION (signal original) (max 15 pts) ────
+        # Mesure si le prix accélère dans une direction
+        # = taux de changement du taux de changement
+        if len(cl1m) >= 5:
+            mom1 = (cl1m[-1] - cl1m[-3]) / cl1m[-3] * 100
+            mom2 = (cl1m[-3] - cl1m[-5]) / cl1m[-5] * 100
+            accel = mom1 - mom2  # accélération positive = momentum qui s'emballe
+
+            if accel > 0.08:
+                long_pts  += 15; reasons_long.append(f'Accélération momentum +{accel:.2f}%')
+            elif accel > 0.04:
+                long_pts  += 8
+            elif accel < -0.08:
+                short_pts += 15; reasons_short.append(f'Accélération momentum -{abs(accel):.2f}%')
+            elif accel < -0.04:
+                short_pts += 8
+
+        # ── 5. BREAKOUT DE CONSOLIDATION (max 20 pts) ───────────────────
         if len(cl15m) >= 20:
             rec_hi = max(cl15m[-20:-1])
             rec_lo = min(cl15m[-20:-1])
-            rng    = (rec_hi - rec_lo) / rec_lo * 100
-            cur    = cl15m[-1]
-            if cur > rec_hi * 1.002 and rng < 8 and direction == 'long':
-                score += 20 * w_bo
-                reasons.append('Breakout haussier confirmé')
-            elif cur < rec_lo * 0.998 and rng < 8 and direction == 'short':
-                score += 20 * w_bo
-                reasons.append('Breakout baissier confirmé')
+            rng_pct = (rec_hi - rec_lo) / rec_lo * 100
+            cur = cl15m[-1]
 
-        # ── RANGE 24H ────────────────────────────── w=1.0
-        w_rng = weights.get('range', 1.0)
+            # Breakout d'une consolidation serrée = mouvement fort probable
+            if rng_pct < 5:  # consolidation serrée < 5%
+                if cur > rec_hi * 1.003:
+                    long_pts  += 20; reasons_long.append(f'Breakout consolidation serrée ({rng_pct:.1f}%)')
+                elif cur < rec_lo * 0.997:
+                    short_pts += 20; reasons_short.append(f'Breakdown consolidation serrée')
+            elif rng_pct < 10:
+                if cur > rec_hi * 1.003:
+                    long_pts  += 12
+                elif cur < rec_lo * 0.997:
+                    short_pts += 12
+
+        # ── 6. POSITION DANS LE RANGE 24H (max 12 pts) ─────────────────
         if high24 > low24:
             pos_r = (price - low24) / (high24 - low24)
-            if direction == 'long'  and pos_r < 0.25:
-                score += 12 * w_rng
-                reasons.append('Prix en bas du range journalier')
-            elif direction == 'short' and pos_r > 0.75:
-                score += 12 * w_rng
-                reasons.append('Prix en haut du range journalier')
-            elif 0.3 <= pos_r <= 0.7: score += 5 * w_rng
+            if pos_r < 0.20:
+                long_pts  += 12; reasons_long.append(f'Bas du range 24h ({pos_r*100:.0f}%)')
+            elif pos_r < 0.35:
+                long_pts  += 7
+            elif pos_r > 0.80:
+                short_pts += 12; reasons_short.append(f'Haut du range 24h ({pos_r*100:.0f}%)')
+            elif pos_r > 0.65:
+                short_pts += 7
 
-        # ── FUNDING ──────────────────────────────── w=1.0
-        w_fund = weights.get('funding', 1.0)
-        fund = get_funding(ticker.get('symbol', ''))
-        if direction == 'long'  and fund < -0.02:
-            score += 10 * w_fund
-            reasons.append(f'Funding {fund:.3f}% favorable')
-        elif direction == 'short' and fund > 0.02:
-            score += 10 * w_fund
-            reasons.append(f'Funding {fund:.3f}% favorable')
-        elif abs(fund) > 0.08: score -= 15
+        # ── 7. FUNDING RATE PRESSURE (max 12 pts) ───────────────────────
+        fund = get_funding(sym)
+        if fund < -0.03:
+            long_pts  += 12; reasons_long.append(f'Funding {fund:.3f}% — shorts surpayent')
+        elif fund < -0.01:
+            long_pts  += 6
+        elif fund > 0.03:
+            short_pts += 12; reasons_short.append(f'Funding {fund:.3f}% — longs surpayent')
+        elif fund > 0.01:
+            short_pts += 6
+        if abs(fund) > 0.1:  # funding extrême = reversal imminent
+            if fund > 0: long_pts  += 8; reasons_long.append('Funding extrême — reversal')
+            else:        short_pts += 8; reasons_short.append('Funding extrême — reversal')
 
-        # ── MALUS ────────────────────────────────────────────────────
-        # Déjà trop pumpé
-        if chg24 > 20 and direction == 'long':  score -= 15
-        if chg24 < -20 and direction == 'short': score -= 15
-        # ATR — volatilité
+        # ── 8. ORDER BOOK PRESSURE (max 15 pts) ─────────────────────────
+        imbalance = get_orderbook_imbalance(sym)
+        if imbalance > 2.5:
+            long_pts  += 15; reasons_long.append(f'Carnet {imbalance:.1f}x acheteurs')
+        elif imbalance > 1.6:
+            long_pts  += 8
+        elif imbalance < 0.4:
+            short_pts += 15; reasons_short.append(f'Carnet {1/imbalance:.1f}x vendeurs')
+        elif imbalance < 0.6:
+            short_pts += 8
+        elif imbalance < 0.8:
+            long_pts  -= 5
+
+        # ── 9. LIQUIDATION CASCADE DETECTOR (signal original) (max 25 pts)
+        # Mesure si des liquidations forcées créent une opportunité
+        # Concept: quand beaucoup de longs se font liquider → prix baisse vite → rebond imminent
+        liq_data = get_liquidations(sym)
+        if liq_data:
+            liq_long_usd  = liq_data.get('long_usd', 0)   # liquidations longs
+            liq_short_usd = liq_data.get('short_usd', 0)  # liquidations shorts
+
+            # Cascade de liqidations longs = potentiel rebond
+            if liq_long_usd > 500000:
+                long_pts  += 25; reasons_long.append(f'Cascade liq longs ${liq_long_usd/1000:.0f}k → rebond')
+            elif liq_long_usd > 100000:
+                long_pts  += 12
+
+            # Cascade de liquidations shorts = continuation baisse
+            if liq_short_usd > 500000:
+                short_pts += 25; reasons_short.append(f'Cascade liq shorts ${liq_short_usd/1000:.0f}k → continuation')
+            elif liq_short_usd > 100000:
+                short_pts += 12
+
+        # ── 10. OPEN INTEREST MOMENTUM (signal original) (max 15 pts) ──
+        # OI qui monte avec le prix = confirmation. OI qui monte contre prix = divergence danger
+        try:
+            oi_r = GET('/api/v2/mix/market/open-interest', {'symbol': sym, 'productType': 'USDT-FUTURES'})
+            oi_val = float((oi_r.get('data') or [{}])[0].get('size', 0)) if oi_r.get('data') else 0
+            oi_prev = float(state_oi_cache.get(sym, oi_val))
+            state_oi_cache[sym] = oi_val
+            oi_change = (oi_val - oi_prev) / oi_prev * 100 if oi_prev > 0 else 0
+
+            if len(cl5m) >= 2:
+                price_up = cl5m[-1] > cl5m[-2]
+                oi_up    = oi_change > 0.3
+
+                if oi_up and price_up:
+                    long_pts  += 15; reasons_long.append(f'OI+prix ↑ confirmation long')
+                elif oi_up and not price_up:
+                    short_pts += 15; reasons_short.append(f'OI↑ prix↓ → short squeeze')
+                elif not oi_up and price_up:
+                    long_pts  -= 8  # hausse sans OI = weak rally
+        except: pass
+
+        # ── 11. MICRO-STRUCTURE PRIX (signal original) (max 12 pts) ────
+        # Analyse des mèches des bougies — révèle les intentions cachées
+        if len(c5m) >= 5:
+            upper_wicks = []  # mèches hautes = rejet vendeurs
+            lower_wicks = []  # mèches basses = rejet acheteurs
+            for candle in c5m[-5:]:
+                try:
+                    o,h,l,c_,v = float(candle[1]),float(candle[2]),float(candle[3]),float(candle[4]),float(candle[5])
+                    body_top = max(o,c_); body_bot = min(o,c_)
+                    upper_wicks.append(h - body_top)
+                    lower_wicks.append(body_bot - l)
+                except: pass
+
+            if upper_wicks and lower_wicks:
+                avg_upper = sum(upper_wicks)/len(upper_wicks)
+                avg_lower = sum(lower_wicks)/len(lower_wicks)
+
+                # Mèches basses longues = acheteurs défendent le niveau → long
+                if avg_lower > avg_upper * 2 and avg_lower > price * 0.001:
+                    long_pts  += 12; reasons_long.append('Mèches basses: acheteurs défendent')
+                # Mèches hautes longues = vendeurs défendent → short
+                elif avg_upper > avg_lower * 2 and avg_upper > price * 0.001:
+                    short_pts += 12; reasons_short.append('Mèches hautes: vendeurs défendent')
+
+        # ── 12. VOLATILITÉ RELATIVE (max 8 pts, malus si trop volatile) ─
         a = atr(c5m)
         atr_pct = (a / price * 100) if price > 0 else 0
-        if atr_pct > 4: score -= 12  # trop volatile
+        if atr_pct > 5:
+            long_pts  -= 15; short_pts -= 15  # trop volatile = imprévisible
+        elif atr_pct > 3:
+            long_pts  -= 8;  short_pts -= 8
+        elif 0.5 < atr_pct < 2:
+            long_pts  += 8;  short_pts += 8   # volatilité idéale
 
-        # ── ADVANCED SIGNALS BOOST ──────────────────────────────
-        adv_boost, adv_reasons = advanced_score_boost(
-            ticker.get('symbol',''), direction, score
-        )
-        score += adv_boost
-        reasons = (adv_reasons + reasons)[:4]
+        # ── MALUS GÉNÉRAUX ───────────────────────────────────────────────
+        if chg24 > 25 and long_pts > short_pts:  long_pts  -= 20  # déjà trop pumpé
+        if chg24 < -25 and short_pts > long_pts: short_pts -= 20  # déjà trop dumped
 
-        final = min(100, max(0, round(score)))
+        # ── DÉCISION FINALE ──────────────────────────────────────────────
+        if long_pts <= 0 and short_pts <= 0:
+            return None  # pas de signal
+
+        if long_pts >= short_pts:
+            direction = 'long'
+            score = min(100, max(0, round(long_pts)))
+            reasons = reasons_long[:4]
+        else:
+            direction = 'short'
+            score = min(100, max(0, round(short_pts)))
+            reasons = reasons_short[:4]
+
+        if score < MIN_SCORE:
+            return None
+
         return {
-            'score':     final,
+            'score':     score,
             'direction': direction,
-            'reasons':   reasons[:4],
+            'reasons':   reasons,
             'atr_pct':   round(atr_pct, 3),
             'vol_spike': round(vs, 2),
             'rsi_1m':    round(r1m, 1),
             'rsi_5m':    round(r5m, 1),
+            'rsi_15m':   round(r15m, 1),
             'funding':   round(fund, 4),
             'chg24':     round(chg24, 2),
-            'adv_boost': adv_boost,
+            'long_pts':  long_pts,
+            'short_pts': short_pts,
+            'symbol':    sym,
+            'macd':      round(mh5m, 6),
         }
     except Exception as e:
-        log.warning(f'Score error: {e}')
+        log.warning(f'Score error {sym}: {e}')
         return None
+
+# Cache OI pour comparer
+state_oi_cache = {}
 
 # ══ ADAPTIVE LEARNING ═════════════════════════════════════════════════
 def update_weights(state):
@@ -978,6 +1250,66 @@ def check_position(state):
         new_sl = None
         log.info(f'Position monitor: {sym} ep={ep} cp={cp} gain={gain_pct*100:.2f}% liq={liq}')
 
+        # ── DÉCISION IA — toutes les 90 secondes (3 scans) ──────────────
+        state['_ai_scan_count'] = state.get('_ai_scan_count', 0) + 1
+        if state['_ai_scan_count'] % 3 == 0:
+            try:
+                c1m_ai = get_candles(sym, '1m', 20)
+                c1m_btc = get_candles('BTCUSDT', '1m', 10)
+                btc_prices = [float(x[4]) for x in c1m_btc if x]
+                btc_chg = round((btc_prices[-1]-btc_prices[0])/btc_prices[0]*100,2) if len(btc_prices)>1 else 0
+
+                # RSI rapide
+                closes = [float(x[4]) for x in c1m_ai if x]
+                rsi_now = [round(rsi(closes),1), round(rsi(closes[::5]),1), round(rsi(closes[::15] if len(closes)>=15 else closes),1)]
+                macd_now = round(macd(closes) if closes else 0, 6)
+
+                ai_dec = ai_trade_decision(state, c1m_ai, rsi_now, macd_now, btc_chg, context='manage')
+                action = ai_dec.get('action', 'HOLD')
+
+                if action == 'EXIT_NOW':
+                    log.info(f'AI says EXIT: {ai_dec.get("reason")}')
+                    # Fermer la position via Bitget
+                    close_side = 'sell' if dirp == 'long' else 'buy'
+                    sz = state['position'].get('totalSize', 0)
+                    close_r = POST('/api/v2/mix/order/place-order', {
+                        'symbol':      sym,
+                        'productType': 'USDT-FUTURES',
+                        'marginCoin':  'USDT',
+                        'side':        close_side,
+                        'tradeSide':   'close',
+                        'orderType':   'market',
+                        'size':        str(sz),
+                        'force':       'gtc',
+                    })
+                    log.info(f'AI EXIT order: {close_r.get("code")} {close_r.get("msg","")}')
+                    state['_ai_exit_reason'] = ai_dec.get('reason', 'AI decision')
+                    return state
+
+                elif action in ('MOVE_SL', 'MOVE_BOTH'):
+                    new_sl_ai = ai_dec.get('new_sl')
+                    if new_sl_ai and isinstance(new_sl_ai, (int, float)):
+                        # Vérifier que le nouveau SL est dans le bon sens
+                        if dirp == 'long' and new_sl_ai > state['position'].get('sl', 0):
+                            log.info(f'AI MOVE SL: {state["position"]["sl"]} → {new_sl_ai}')
+                            state['position']['sl'] = new_sl_ai
+                        elif dirp == 'short' and new_sl_ai < state['position'].get('sl', 999999):
+                            log.info(f'AI MOVE SL: {state["position"]["sl"]} → {new_sl_ai}')
+                            state['position']['sl'] = new_sl_ai
+
+                elif action in ('MOVE_TP', 'MOVE_BOTH'):
+                    new_tp_ai = ai_dec.get('new_tp')
+                    if new_tp_ai and isinstance(new_tp_ai, (int, float)):
+                        if dirp == 'long' and new_tp_ai > state['position'].get('tp', 0):
+                            log.info(f'AI MOVE TP: {state["position"]["tp"]} → {new_tp_ai}')
+                            state['position']['tp'] = new_tp_ai
+                        elif dirp == 'short' and new_tp_ai < state['position'].get('tp', 999999):
+                            log.info(f'AI MOVE TP: {state["position"]["tp"]} → {new_tp_ai}')
+                            state['position']['tp'] = new_tp_ai
+
+            except Exception as e:
+                log.warning(f'AI manage failed: {e}')
+
         if gain_pct >= TRAIL_STEP4:       # +35%+ → lock +25%
             lock = 0.25
         elif gain_pct >= TRAIL_STEP3:      # +20%+ → lock +12%
@@ -1286,6 +1618,37 @@ def scan(state):
         log.info(f'Consensus détecté: {len(same_dir)} cryptos en {best["direction"]} — boost levier')
 
     log.info(f'Best: {best["symbol"]} score={best["score"]} dir={best["direction"]} consensus={consensus}')
+
+    # ── VALIDATION IA AVANT ENTRÉE ────────────────────────────────────────
+    # Claude valide le signal avant d'ouvrir la position
+    try:
+        c1m_btc = get_candles('BTCUSDT', '1m', 20)
+        btc_prices = [float(x[4]) for x in c1m_btc if x]
+        btc_change = round((btc_prices[-1]-btc_prices[0])/btc_prices[0]*100, 2) if len(btc_prices)>1 else 0
+    except:
+        btc_change = 0
+
+    state['_pending_symbol'] = best['symbol']
+    state['_pending_dir']    = best['direction']
+    state['_pending_score']  = best['score']
+
+    # Récupérer les candles pour Claude
+    try:
+        c1m_ai = get_candles(best['symbol'], '1m', 20)
+    except:
+        c1m_ai = []
+
+    rsi_info = [round(best.get('rsi_1m',50),1), round(best.get('rsi_5m',50),1), round(best.get('rsi_15m',50),1)]
+    macd_info = round(best.get('macd',0), 6)
+
+    ai_verdict = ai_trade_decision(state, c1m_ai, rsi_info, macd_info, btc_change, context='entry')
+
+    if ai_verdict.get('action') == 'SKIP':
+        log.info(f'AI REJECTED trade: {ai_verdict.get("reason")} (conf={ai_verdict.get("confidence")})')
+        state['status'] = f'AI a refusé {best["symbol"]}: {ai_verdict.get("reason","")}'
+        return state
+
+    log.info(f'AI APPROVED entry: {ai_verdict.get("reason")} (conf={ai_verdict.get("confidence")})')
     state['status'] = f'Signal: {best["symbol"]} {best["direction"].upper()} score={best["score"]} — Ouverture…'
 
     pos = place_order(best['symbol'], best['direction'], state['balance'], best,
