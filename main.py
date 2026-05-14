@@ -166,7 +166,7 @@ def _handle_sigterm(signum, frame):
     log.info('SIGTERM reçu — sauvegarde état...')
     try:
         with open(STATE_FILE, 'w') as f:
-            json.dump(state, f)
+            json.dump(S, f)
         log.info('État sauvegardé OK')
     except Exception as e:
         log.error(f'Sauvegarde échouée: {e}')
@@ -1733,13 +1733,13 @@ def api_state():
 def api_ai_status():
     """Retourne le dernier commentaire IA sur la position en cours"""
     from flask import request as flask_req
-    global state
+    global S
     if flask_req.method == 'OPTIONS':
         return cors_json({})
     return cors_json({
-        'message': state.get('ai_live_message', ''),
-        'action':  state.get('ai_live_action', 'HOLD'),
-        'ts':      state.get('ai_live_ts', ''),
+        'message': S.get('ai_live_message', ''),
+        'action':  S.get('ai_live_action', 'HOLD'),
+        'ts':      S.get('ai_live_ts', ''),
     })
 
 @app.route('/api/health')
