@@ -171,7 +171,12 @@ def _handle_sigterm(signum, frame):
     except Exception as e:
         log.error(f'Sauvegarde échouée: {e}')
 
-signal.signal(signal.SIGTERM, _handle_sigterm)
+try:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+except Exception:
+    pass  # Si pas disponible, continuer quand même
+
+
 # ══ TWILIO SMS ════════════════════════════════════════════════════════
 TWILIO_SID   = os.environ.get('TWILIO_SID', '')
 TWILIO_TOKEN = os.environ.get('TWILIO_TOKEN', '')
