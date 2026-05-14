@@ -19,9 +19,9 @@ BASE       = 'https://api.bitget.com'
 
 LEVERAGE      = 15       # levier de base (sera overridé dynamiquement)
 RISK_PCT      = 0.55     # 55% du capital par trade
-TP_PCT        = 0.04     # take profit +4% — plus réaliste
-SL_PCT        = 0.035    # stop loss -3.5% — sécuritaire avec x15 (liq à ~6.5%)
-MIN_SCORE     = 70       # score minimum — signaux solides seulement
+TP_PCT        = 0.025    # take profit +2.5% — proche et réaliste
+SL_PCT        = 0.020    # stop loss -2% — serré mais IA sort avant si nécessaire
+MIN_SCORE     = 75       # score minimum — très sélectif
 SCAN_SEC      = 30       # scan toutes les 30 secondes
 MIN_VOL_24H   = 8_000_000  # volume minimum USDT
 
@@ -130,7 +130,7 @@ DÉCIDE maintenant. JSON uniquement:
 
     try:
         body = _json.dumps({
-            'model': 'claude-sonnet-4-20250514',
+            'model': 'claude-sonnet-4-5',
             'max_tokens': 150,
             'messages': [{'role': 'user', 'content': prompt}]
         }).encode()
@@ -828,7 +828,7 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
             'long_pts':  long_pts,
             'short_pts': short_pts,
             'symbol':    sym,
-            'macd':      round(mh5m, 6),
+            'macd':      round(mh5m, 6),  # macd_hist value
         }
     except Exception as e:
         log.warning(f'Score error {sym}: {e}')
@@ -1027,10 +1027,11 @@ def place_order(symbol, direction, balance, scored, state_balance_info=None):
             return None
 
         order_id = r['data']['orderId']
-        time.sleep(2.0)  # Attendre que la position soit ouverte
+        time.sleep(3.0)  # Attendre que la position soit ouverte
 
-        # Récupérer le vrai prix de liquidation depuis Bitget
+        # Récupérer le vrai prix de liquidation ET la taille réelle depuis Bitget
         real_liq = 0.0
+        real_size = size  # fallback
         tp_price_final = tp_price
         sl_price_final = sl_price
         try:
@@ -1039,8 +1040,9 @@ def place_order(symbol, direction, balance, scored, state_balance_info=None):
             })
             for p in (pos_data.get('data') or []):
                 if p.get('symbol') == symbol and float(p.get('total', 0)) > 0:
-                    real_liq = float(p.get('liquidationPrice', 0))
-                    log.info(f'Real liq price: {real_liq}')
+                    real_liq  = float(p.get('liquidationPrice', 0))
+                    real_size = float(p.get('total', size))
+                    log.info(f'Real liq: {real_liq} | Real size: {real_size}')
                     break
             if real_liq > 0:
                 if direction == 'long':
@@ -1071,7 +1073,7 @@ def place_order(symbol, direction, balance, scored, state_balance_info=None):
                 'triggerPrice': str(round(trigger_price, price_dec)),
                 'triggerType':  'mark_price',
                 'holdSide':     hold_side,
-                'size':         str(size),
+                'size':         str(real_size),
             }
             r = POST('/api/v2/mix/order/place-tpsl-order', body)
             log.info(f'{label} at {trigger_price}: code={r.get("code")} msg={r.get("msg","")}')
@@ -1250,6 +1252,21 @@ def check_position(state):
         new_sl = None
         log.info(f'Position monitor: {sym} ep={ep} cp={cp} gain={gain_pct*100:.2f}% liq={liq}')
 
+        # AUTO-EXIT si perte > 1.8% sur le prix — avant que le SL soit touché
+        # L'IA aurait dû sortir mais si elle échoue, cette sécurité prend le relais
+        if gain_pct < -0.018:
+            log.info(f'AUTO-EXIT: perte {gain_pct*100:.2f}% dépasse seuil -1.8% — sortie protectrice')
+            close_side = 'sell' if dirp == 'long' else 'buy'
+            sz = state['position'].get('totalSize', 0)
+            if sz > 0:
+                cr = POST('/api/v2/mix/order/place-order', {
+                    'symbol': sym, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
+                    'side': close_side, 'tradeSide': 'close', 'orderType': 'market',
+                    'size': str(sz), 'force': 'gtc',
+                })
+                log.info(f'Auto-exit order: {cr.get("code")} {cr.get("msg","")}')
+            return state
+
         # ── DÉCISION IA — toutes les 90 secondes (3 scans) ──────────────
         state['_ai_scan_count'] = state.get('_ai_scan_count', 0) + 1
         if state['_ai_scan_count'] % 3 == 0:
@@ -1262,7 +1279,7 @@ def check_position(state):
                 # RSI rapide
                 closes = [float(x[4]) for x in c1m_ai if x]
                 rsi_now = [round(rsi(closes),1), round(rsi(closes[::5]),1), round(rsi(closes[::15] if len(closes)>=15 else closes),1)]
-                macd_now = round(macd(closes) if closes else 0, 6)
+                macd_now = round(macd_hist(closes) if closes else 0, 6)
 
                 ai_dec = ai_trade_decision(state, c1m_ai, rsi_now, macd_now, btc_chg, context='manage')
                 action = ai_dec.get('action', 'HOLD')
