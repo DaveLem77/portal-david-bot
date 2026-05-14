@@ -1278,6 +1278,7 @@ def check_position(state):
             if sz > 0:
                 cr = POST('/api/v2/mix/order/place-order', {
                     'symbol': sym, 'productType': 'USDT-FUTURES', 'marginCoin': 'USDT',
+                    'marginMode': 'isolated',
                     'side': close_side, 'tradeSide': 'close', 'orderType': 'market',
                     'size': str(sz), 'force': 'gtc',
                 })
@@ -1300,16 +1301,17 @@ def check_position(state):
 
                 ai_dec = ai_trade_decision(state, c1m_ai, rsi_now, macd_now, btc_chg, context='manage')
                 action = ai_dec.get('action', 'HOLD')
-                # Sauvegarder le commentaire IA pour le dashboard (dans S global ET state)
+                reason = ai_dec.get('reason', '')
+                # Stocker immédiatement dans S global pour /api/ai-status
                 from datetime import datetime as _dt, timezone as _tz
                 _ts = _dt.now(_tz.utc).isoformat()
-                state['ai_live_message'] = ai_dec.get('reason', '')
-                state['ai_live_action']  = action
-                state['ai_live_ts']      = _ts
-                # Aussi dans S global pour que l'endpoint /api/ai-status le lise
-                S['ai_live_message'] = ai_dec.get('reason', '')
+                S['ai_live_message'] = reason
                 S['ai_live_action']  = action
                 S['ai_live_ts']      = _ts
+                state['ai_live_message'] = reason
+                state['ai_live_action']  = action
+                state['ai_live_ts']      = _ts
+                log.info(f'AI stored in S: action={action} msg={reason[:60]}')
 
                 if action == 'EXIT_NOW':
                     log.info(f'AI says EXIT: {ai_dec.get("reason")}')
@@ -1320,6 +1322,7 @@ def check_position(state):
                         'symbol':      sym,
                         'productType': 'USDT-FUTURES',
                         'marginCoin':  'USDT',
+                        'marginMode':  'isolated',
                         'side':        close_side,
                         'tradeSide':   'close',
                         'orderType':   'market',
