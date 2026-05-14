@@ -1300,11 +1300,16 @@ def check_position(state):
 
                 ai_dec = ai_trade_decision(state, c1m_ai, rsi_now, macd_now, btc_chg, context='manage')
                 action = ai_dec.get('action', 'HOLD')
-                # Sauvegarder le commentaire IA pour le dashboard
+                # Sauvegarder le commentaire IA pour le dashboard (dans S global ET state)
                 from datetime import datetime as _dt, timezone as _tz
+                _ts = _dt.now(_tz.utc).isoformat()
                 state['ai_live_message'] = ai_dec.get('reason', '')
                 state['ai_live_action']  = action
-                state['ai_live_ts']      = _dt.now(_tz.utc).isoformat()
+                state['ai_live_ts']      = _ts
+                # Aussi dans S global pour que l'endpoint /api/ai-status le lise
+                S['ai_live_message'] = ai_dec.get('reason', '')
+                S['ai_live_action']  = action
+                S['ai_live_ts']      = _ts
 
                 if action == 'EXIT_NOW':
                     log.info(f'AI says EXIT: {ai_dec.get("reason")}')
