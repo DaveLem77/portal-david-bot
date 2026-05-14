@@ -1266,6 +1266,11 @@ def check_position(state):
 
                 ai_dec = ai_trade_decision(state, c1m_ai, rsi_now, macd_now, btc_chg, context='manage')
                 action = ai_dec.get('action', 'HOLD')
+                # Sauvegarder le commentaire IA pour le dashboard
+                from datetime import datetime as _dt, timezone as _tz
+                state['ai_live_message'] = ai_dec.get('reason', '')
+                state['ai_live_action']  = action
+                state['ai_live_ts']      = _dt.now(_tz.utc).isoformat()
 
                 if action == 'EXIT_NOW':
                     log.info(f'AI says EXIT: {ai_dec.get("reason")}')
@@ -1689,6 +1694,17 @@ def root():
 @app.route('/api/state')
 def api_state():
     return cors_json(load_state())
+
+@app.route('/api/ai-status', methods=['GET', 'OPTIONS'])
+def api_ai_status():
+    """Retourne le dernier commentaire IA sur la position en cours"""
+    if request.method == 'OPTIONS':
+        return cors_json({})
+    return cors_json({
+        'message': state.get('ai_live_message', ''),
+        'action':  state.get('ai_live_action', 'HOLD'),
+        'ts':      state.get('ai_live_ts', ''),
+    })
 
 @app.route('/api/health')
 def api_health():
