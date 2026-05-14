@@ -1716,6 +1716,7 @@ def api_state():
 def api_ai_status():
     """Retourne le dernier commentaire IA sur la position en cours"""
     from flask import request as flask_req
+    global state
     if flask_req.method == 'OPTIONS':
         return cors_json({})
     return cors_json({
