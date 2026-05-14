@@ -160,6 +160,18 @@ DÉCIDE maintenant. JSON uniquement:
     return {'action': 'HOLD' if context=='manage' else 'ENTER', 'reason': 'AI unavailable', 'confidence': 60}
 
 STATE_FILE = '/tmp/pdv4.json'  # v4 — nouveau départ 175$
+
+def _handle_sigterm(signum, frame):
+    """Sauvegarde l'état avant que Render tue le process"""
+    log.info('SIGTERM reçu — sauvegarde état...')
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f)
+        log.info('État sauvegardé OK')
+    except Exception as e:
+        log.error(f'Sauvegarde échouée: {e}')
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
 # ══ TWILIO SMS ════════════════════════════════════════════════════════
 TWILIO_SID   = os.environ.get('TWILIO_SID', '')
 TWILIO_TOKEN = os.environ.get('TWILIO_TOKEN', '')
@@ -1516,9 +1528,9 @@ def scan(state):
 
     # Warmup — attendre 6 scans (3 min) avant de trader après un redémarrage
     # Évite d'ouvrir un trade immédiatement sur données insuffisantes
-    if state['_scan_count'] < 6:
-        state['status'] = f'Warmup… ({state["_scan_count"]}/6 scans)'
-        log.info(f'Warmup scan {state["_scan_count"]}/6 — pas de trade encore')
+    if state['_scan_count'] < 2 and not state.get('position'):
+        state['status'] = f'Warmup… ({state["_scan_count"]}/2 scans)'
+        log.info(f'Warmup scan {state["_scan_count"]}/2 — pas de trade encore')
         return state
     today = str(datetime.now(timezone.utc).date())
     if state.get('today_date') != today:
