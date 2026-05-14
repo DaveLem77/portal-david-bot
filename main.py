@@ -1715,7 +1715,8 @@ def api_state():
 @app.route('/api/ai-status', methods=['GET', 'OPTIONS'])
 def api_ai_status():
     """Retourne le dernier commentaire IA sur la position en cours"""
-    if request.method == 'OPTIONS':
+    from flask import request as flask_req
+    if flask_req.method == 'OPTIONS':
         return cors_json({})
     return cors_json({
         'message': state.get('ai_live_message', ''),
