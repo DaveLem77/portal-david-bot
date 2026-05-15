@@ -590,361 +590,217 @@ def get_liquidations(symbol):
         return None
 
 def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
-    """
-    Moteur de scoring v5 — 12 signaux dont 4 jamais utilisés dans les bots publics.
-    Score 0-100. Direction déterminée par consensus pondéré.
-    """
+    """Moteur de scoring v5 — 100% défensif contre les formats Bitget inattendus"""
+    sym = '?'
     try:
-        price  = float(ticker.get('lastPr', 0))
-        vol24  = float(ticker.get('usdtVolume', 0))
-        chg24  = float(ticker.get('change24h', 0)) * 100
-        high24 = float(ticker.get('high24h', price))
-        low24  = float(ticker.get('low24h', price))
-        sym    = ticker.get('symbol', '')
-
+        price  = float(ticker.get('lastPr', 0) or 0)
+        vol24  = float(ticker.get('usdtVolume', 0) or 0)
+        chg24  = float(ticker.get('change24h', 0) or 0) * 100
+        high24 = float(ticker.get('high24h', price) or price)
+        low24  = float(ticker.get('low24h', price) or price)
+        sym    = str(ticker.get('symbol', ''))
         if price <= 0 or vol24 < MIN_VOL_24H:
             return None
 
-        def cl(c): return [float(x[4]) for x in c] if c else []
-        def hi(c):
-            if not c or not isinstance(c, list): return []
-            return [float(x.get('h',x[2]) if isinstance(x,dict) else x[2]) for x in c if isinstance(x,(dict,list,tuple))]
-        def lo(c):
-            if not c: return []
-            return [float(x.get('l',x[3]) if isinstance(x,dict) else x[3]) for x in c if isinstance(x,(dict,list,tuple))]
-        def vo(c):
-            if not c: return []
-            return [float(x.get('v',x[5]) if isinstance(x,dict) else x[5]) for x in c if isinstance(x,(dict,list,tuple)) and len(x)>5]
-
-        # Defensive: extract close prices from raw candles (handles list AND dict format)
-        def safe_cl(candles):
-            if not candles or not isinstance(candles, list): return []
-            result = []
-            for x in candles:
-                try:
-                    if isinstance(x, dict):
-                        result.append(float(x.get('c', x.get('close', 0))))
-                    elif isinstance(x, (list, tuple)) and len(x) > 4:
-                        result.append(float(x[4]))
-                except: pass
-            return result
-
-        # Keep raw candles for vol_spike/atr, use safe_cl for RSI/MACD
-        cl1m  = safe_cl(c1m);  cl5m = safe_cl(c5m)
-        cl15m = safe_cl(c15m); cl1h = safe_cl(c1h)
-        cl4h  = safe_cl(c4h) if c4h else cl1h
-        # Raw candles for functions that need OHLCV
-        # raw5m: normalize to list format for vol_spike/atr
-        def to_raw(x):
-            if isinstance(x, dict): return [x.get('ts',0),x.get('o',0),x.get('h',0),x.get('l',0),x.get('c',0),x.get('v',0)]
-            if isinstance(x,(list,tuple)) and len(x)>5: return list(x)
+        # Extraction sécurisée des closes — gère list/dict/float
+        def get_close(x):
+            try:
+                if isinstance(x, dict):   return float(x.get('c') or x.get('close') or 0)
+                if isinstance(x, (list, tuple)) and len(x) > 4: return float(x[4])
+            except: pass
             return None
-        c5m_safe = c5m if isinstance(c5m, list) else []
-        raw5m = [r for r in [to_raw(x) for x in c5m_safe] if r is not None]
-        hi5m  = hi(c5m);  lo5m = lo(c5m)
-        vo5m  = vo(c5m);  vo1m = vo(c1m)
 
-        long_pts = 0   # points favorables au LONG
-        short_pts = 0  # points favorables au SHORT
-        reasons_long  = []
-        reasons_short = []
+        def get_field(x, idx, key):
+            try:
+                if isinstance(x, dict):   return float(x.get(key) or 0)
+                if isinstance(x, (list, tuple)) and len(x) > idx: return float(x[idx])
+            except: pass
+            return 0.0
 
-        # ── 1. RSI MULTI-TIMEFRAME (max 30 pts) ─────────────────────────
-        r1m  = rsi(cl1m)
-        r5m  = rsi(cl5m)
-        r15m = rsi(cl15m)
-        r1h  = rsi(cl1h)
-        r4h  = rsi(cl4h)
+        def safe_closes(candles):
+            if not isinstance(candles, list): return []
+            return [v for v in [get_close(x) for x in candles] if v is not None and v > 0]
 
-        # RSI 1m + 5m survente cascade → long puissant
+        def safe_raw(candles):
+            """Retourne candles filtrées valides (list ou dict)"""
+            if not isinstance(candles, list): return []
+            return [x for x in candles if isinstance(x, (list, tuple, dict))]
+
+        cl1m  = safe_closes(c1m)
+        cl5m  = safe_closes(c5m)
+        cl15m = safe_closes(c15m)
+        cl1h  = safe_closes(c1h)
+        cl4h  = safe_closes(c4h) if c4h else cl1h
+        raw5m = safe_raw(c5m)
+
+        long_pts = 0; short_pts = 0
+        reasons_long = []; reasons_short = []
+
+        # 1. RSI MULTI-TIMEFRAME
+        r1m  = rsi(cl1m)  if len(cl1m)  > 14 else 50.0
+        r5m  = rsi(cl5m)  if len(cl5m)  > 14 else 50.0
+        r15m = rsi(cl15m) if len(cl15m) > 14 else 50.0
+        r1h  = rsi(cl1h)  if len(cl1h)  > 14 else 50.0
+        r4h  = rsi(cl4h)  if len(cl4h)  > 14 else 50.0
+
         if r1m < 25 and r5m < 30:
             long_pts += 30; reasons_long.append(f'RSI cascade survente {r1m:.0f}/{r5m:.0f}')
-        elif r1m < 32 and r5m < 38:
+        elif r1m < 35 and r5m < 40:
             long_pts += 20; reasons_long.append(f'RSI survendu {r1m:.0f}/{r5m:.0f}')
-        elif r1m < 40:
-            long_pts += 10
+        elif r1m < 42: long_pts += 10
 
         if r1m > 75 and r5m > 70:
             short_pts += 30; reasons_short.append(f'RSI cascade surachat {r1m:.0f}/{r5m:.0f}')
-        elif r1m > 68 and r5m > 62:
+        elif r1m > 65 and r5m > 60:
             short_pts += 20; reasons_short.append(f'RSI surachat {r1m:.0f}/{r5m:.0f}')
-        elif r1m > 60:
-            short_pts += 10
+        elif r1m > 58: short_pts += 10
 
-        # Confirmation 15m
         if r15m < 45: long_pts  += 8
         if r15m > 55: short_pts += 8
 
-        # FILTRE TENDANCE 1H obligatoire — anti contre-tendance
-        if r1h > 68:   long_pts  -= 20  # surachat 1h → danger long
+        # Filtre 1H
+        if r1h > 68:   long_pts  -= 20
         elif r1h < 50: long_pts  += 10
-        if r1h < 32:   short_pts -= 20  # survente 1h → danger short
+        if r1h < 32:   short_pts -= 20
         elif r1h > 50: short_pts += 10
 
-        # FILTRE 4H RSI
-        r4h = rsi(cl4h)
+        # Filtre 4H
         if r4h > 72:   long_pts  -= 25
         elif r4h < 55: long_pts  += 8
         if r4h < 28:   short_pts -= 25
         elif r4h > 45: short_pts += 8
 
-        # ── FILTRE EMA TENDANCE 1H — CRITIQUE ───────────────────────────
-        # RSI survendu dans tendance baissière = piège. EMA filtre ça.
+        # Filtre EMA tendance 1H
         dir_test = 'long' if long_pts >= short_pts else 'short'
-        trend_valid, trend_force = trend_ok(cl1h if isinstance(cl1h, list) else [], dir_test)
-        if not trend_valid:
-            if dir_test == 'long':
-                long_pts -= 40
-                reasons_long.append('BLOQUÉ: contre-tendance EMA 1H')
-            else:
-                short_pts -= 40
-                reasons_short.append('BLOQUÉ: contre-tendance EMA 1H')
-        elif trend_force >= 70:
-            if dir_test == 'long':
-                long_pts += 15; reasons_long.append('EMA haussière confirmée')
-            else:
-                short_pts += 15; reasons_short.append('EMA baissière confirmée')
-
-        # ── 2. MACD MOMENTUM (max 20 pts) ───────────────────────────────
-        mh1m  = macd_hist(cl1m)
-        mh5m  = macd_hist(cl5m)
-        mh15m = macd_hist(cl15m)
-
-        # Croisement MACD 1m qui confirme 5m
-        if mh1m > 0 and mh5m > 0 and mh15m > 0:
-            long_pts += 20; reasons_long.append('MACD haussier aligné 1m+5m+15m')
-        elif mh1m > 0 and mh5m > 0:
-            long_pts += 12
-        elif mh1m > 0:
-            long_pts += 6
-
-        if mh1m < 0 and mh5m < 0 and mh15m < 0:
-            short_pts += 20; reasons_short.append('MACD baissier aligné 1m+5m+15m')
-        elif mh1m < 0 and mh5m < 0:
-            short_pts += 12
-        elif mh1m < 0:
-            short_pts += 6
-
-        # ── 3. VOLUME ANOMALY DETECTION (max 18 pts) ────────────────────
-        # Signal original: détecter l'accumulation silencieuse
-        # Volume croissant sur 3 bougies = gros acteur qui rentre
-        vs = vol_spike(raw5m)
-        if vs > 5:
-            # Volume explosif — direction du mouvement associé
-            if len(cl5m) >= 2 and cl5m[-1] > cl5m[-2]:
-                long_pts  += 18; reasons_long.append(f'Volume x{vs:.1f} avec hausse prix')
-            else:
-                short_pts += 18; reasons_short.append(f'Volume x{vs:.1f} avec baisse prix')
-        elif vs > 3:
-            if len(cl5m) >= 2 and cl5m[-1] > cl5m[-2]:
-                long_pts  += 12
-            else:
-                short_pts += 12
-        elif vs > 1.8:
-            if len(cl5m) >= 2 and cl5m[-1] > cl5m[-2]:
-                long_pts  += 6
-            else:
-                short_pts += 6
-        elif vs < 0.4:
-            long_pts  -= 8  # volume mort — éviter
-            short_pts -= 8
-
-        # ── 4. MOMENTUM ACCÉLÉRATION (signal original) (max 15 pts) ────
-        # Mesure si le prix accélère dans une direction
-        # = taux de changement du taux de changement
-        if len(cl1m) >= 5:
-            mom1 = (cl1m[-1] - cl1m[-3]) / cl1m[-3] * 100
-            mom2 = (cl1m[-3] - cl1m[-5]) / cl1m[-5] * 100
-            accel = mom1 - mom2  # accélération positive = momentum qui s'emballe
-
-            if accel > 0.08:
-                long_pts  += 15; reasons_long.append(f'Accélération momentum +{accel:.2f}%')
-            elif accel > 0.04:
-                long_pts  += 8
-            elif accel < -0.08:
-                short_pts += 15; reasons_short.append(f'Accélération momentum -{abs(accel):.2f}%')
-            elif accel < -0.04:
-                short_pts += 8
-
-        # ── 5. BREAKOUT DE CONSOLIDATION (max 20 pts) ───────────────────
-        if len(cl15m) >= 20:
-            rec_hi = max(cl15m[-20:-1])
-            rec_lo = min(cl15m[-20:-1])
-            rng_pct = (rec_hi - rec_lo) / rec_lo * 100
-            cur = cl15m[-1]
-
-            # Breakout d'une consolidation serrée = mouvement fort probable
-            if rng_pct < 5:  # consolidation serrée < 5%
-                if cur > rec_hi * 1.003:
-                    long_pts  += 20; reasons_long.append(f'Breakout consolidation serrée ({rng_pct:.1f}%)')
-                elif cur < rec_lo * 0.997:
-                    short_pts += 20; reasons_short.append(f'Breakdown consolidation serrée')
-            elif rng_pct < 10:
-                if cur > rec_hi * 1.003:
-                    long_pts  += 12
-                elif cur < rec_lo * 0.997:
-                    short_pts += 12
-
-        # ── 6. POSITION DANS LE RANGE 24H (max 12 pts) ─────────────────
-        if high24 > low24:
-            pos_r = (price - low24) / (high24 - low24)
-            if pos_r < 0.20:
-                long_pts  += 12; reasons_long.append(f'Bas du range 24h ({pos_r*100:.0f}%)')
-            elif pos_r < 0.35:
-                long_pts  += 7
-            elif pos_r > 0.80:
-                short_pts += 12; reasons_short.append(f'Haut du range 24h ({pos_r*100:.0f}%)')
-            elif pos_r > 0.65:
-                short_pts += 7
-
-        # ── 7. FUNDING RATE PRESSURE (max 12 pts) ───────────────────────
-        fund = get_funding(sym)
-        if fund < -0.03:
-            long_pts  += 12; reasons_long.append(f'Funding {fund:.3f}% — shorts surpayent')
-        elif fund < -0.01:
-            long_pts  += 6
-        elif fund > 0.03:
-            short_pts += 12; reasons_short.append(f'Funding {fund:.3f}% — longs surpayent')
-        elif fund > 0.01:
-            short_pts += 6
-        if abs(fund) > 0.1:  # funding extrême = reversal imminent
-            if fund > 0: long_pts  += 8; reasons_long.append('Funding extrême — reversal')
-            else:        short_pts += 8; reasons_short.append('Funding extrême — reversal')
-
-        # ── 8. ORDER BOOK PRESSURE (max 15 pts) ─────────────────────────
-        imbalance = get_orderbook_imbalance(sym)
-        if imbalance > 2.5:
-            long_pts  += 15; reasons_long.append(f'Carnet {imbalance:.1f}x acheteurs')
-        elif imbalance > 1.6:
-            long_pts  += 8
-        elif imbalance < 0.4:
-            short_pts += 15; reasons_short.append(f'Carnet {1/imbalance:.1f}x vendeurs')
-        elif imbalance < 0.6:
-            short_pts += 8
-        elif imbalance < 0.8:
-            long_pts  -= 5
-
-        # ── 9. LIQUIDATION CASCADE DETECTOR (signal original) (max 25 pts)
-        # Mesure si des liquidations forcées créent une opportunité
-        # Concept: quand beaucoup de longs se font liquider → prix baisse vite → rebond imminent
-        liq_data = get_liquidations(sym)
-        if liq_data:
-            liq_long_usd  = liq_data.get('long_usd', 0)   # liquidations longs
-            liq_short_usd = liq_data.get('short_usd', 0)  # liquidations shorts
-
-            # Cascade de liqidations longs = potentiel rebond
-            if liq_long_usd > 500000:
-                long_pts  += 25; reasons_long.append(f'Cascade liq longs ${liq_long_usd/1000:.0f}k → rebond')
-            elif liq_long_usd > 100000:
-                long_pts  += 12
-
-            # Cascade de liquidations shorts = continuation baisse
-            if liq_short_usd > 500000:
-                short_pts += 25; reasons_short.append(f'Cascade liq shorts ${liq_short_usd/1000:.0f}k → continuation')
-            elif liq_short_usd > 100000:
-                short_pts += 12
-
-        # ── 10. OPEN INTEREST MOMENTUM (signal original) (max 15 pts) ──
-        # OI qui monte avec le prix = confirmation. OI qui monte contre prix = divergence danger
         try:
-            oi_r = GET('/api/v2/mix/market/open-interest', {'symbol': sym, 'productType': 'USDT-FUTURES'})
-            oi_data = oi_r.get('data')
-            if isinstance(oi_data, list) and oi_data:
-                oi_val = float(oi_data[0].get('size', 0))
-            elif isinstance(oi_data, dict):
-                oi_val = float(oi_data.get('size', 0))
-            else:
-                oi_val = 0
-            oi_prev = float(state_oi_cache.get(sym, oi_val))
-            state_oi_cache[sym] = oi_val
-            oi_change = (oi_val - oi_prev) / oi_prev * 100 if oi_prev > 0 else 0
-
-            if len(cl5m) >= 2:
-                price_up = cl5m[-1] > cl5m[-2]
-                oi_up    = oi_change > 0.3
-
-                if oi_up and price_up:
-                    long_pts  += 15; reasons_long.append(f'OI+prix ↑ confirmation long')
-                elif oi_up and not price_up:
-                    short_pts += 15; reasons_short.append(f'OI↑ prix↓ → short squeeze')
-                elif not oi_up and price_up:
-                    long_pts  -= 8  # hausse sans OI = weak rally
+            trend_valid, trend_force = trend_ok(cl1h, dir_test)
+            if not trend_valid:
+                if dir_test == 'long':
+                    long_pts -= 40; reasons_long.append('BLOQUÉ: contre-tendance EMA 1H')
+                else:
+                    short_pts -= 40; reasons_short.append('BLOQUÉ: contre-tendance EMA 1H')
+            elif trend_force >= 70:
+                if dir_test == 'long':
+                    long_pts += 15; reasons_long.append('EMA haussière confirmée')
+                else:
+                    short_pts += 15; reasons_short.append('EMA baissière confirmée')
         except: pass
 
-        # ── 11. MICRO-STRUCTURE PRIX (signal original) (max 12 pts) ────
-        # Analyse des mèches des bougies — révèle les intentions cachées
-        if len(raw5m) >= 5:
-            upper_wicks = []  # mèches hautes = rejet vendeurs
-            lower_wicks = []  # mèches basses = rejet acheteurs
-            for candle in raw5m[-5:]:
-                try:
-                    o,h,l,c_,v = float(candle[1]),float(candle[2]),float(candle[3]),float(candle[4]),float(candle[5])
-                    body_top = max(o,c_); body_bot = min(o,c_)
-                    upper_wicks.append(h - body_top)
-                    lower_wicks.append(body_bot - l)
-                except: pass
+        # 2. MACD
+        try:
+            mh1m  = macd_hist(cl1m)  if len(cl1m)  > 26 else 0
+            mh5m  = macd_hist(cl5m)  if len(cl5m)  > 26 else 0
+            mh15m = macd_hist(cl15m) if len(cl15m) > 26 else 0
+            if mh1m > 0 and mh5m > 0 and mh15m > 0:
+                long_pts += 20; reasons_long.append('MACD haussier 1m+5m+15m')
+            elif mh1m > 0 and mh5m > 0: long_pts += 12
+            elif mh1m > 0: long_pts += 6
+            if mh1m < 0 and mh5m < 0 and mh15m < 0:
+                short_pts += 20; reasons_short.append('MACD baissier 1m+5m+15m')
+            elif mh1m < 0 and mh5m < 0: short_pts += 12
+            elif mh1m < 0: short_pts += 6
+        except: pass
 
-            if upper_wicks and lower_wicks:
-                avg_upper = sum(upper_wicks)/len(upper_wicks)
-                avg_lower = sum(lower_wicks)/len(lower_wicks)
+        # 3. VOLUME
+        try:
+            vs = vol_spike(raw5m)
+            if vs > 5:
+                if len(cl5m)>=2 and cl5m[-1]>cl5m[-2]: long_pts+=18; reasons_long.append(f'Volume x{vs:.1f}')
+                else: short_pts+=18; reasons_short.append(f'Volume x{vs:.1f}')
+            elif vs > 3:
+                if len(cl5m)>=2 and cl5m[-1]>cl5m[-2]: long_pts+=12
+                else: short_pts+=12
+            elif vs < 0.4: long_pts-=8; short_pts-=8
+        except: pass
 
-                # Mèches basses longues = acheteurs défendent le niveau → long
-                if avg_lower > avg_upper * 2 and avg_lower > price * 0.001:
-                    long_pts  += 12; reasons_long.append('Mèches basses: acheteurs défendent')
-                # Mèches hautes longues = vendeurs défendent → short
-                elif avg_upper > avg_lower * 2 and avg_upper > price * 0.001:
-                    short_pts += 12; reasons_short.append('Mèches hautes: vendeurs défendent')
+        # 4. MOMENTUM ACCÉLÉRATION
+        try:
+            if len(cl1m) >= 5:
+                mom1 = (cl1m[-1]-cl1m[-3])/cl1m[-3]*100 if cl1m[-3]>0 else 0
+                mom2 = (cl1m[-3]-cl1m[-5])/cl1m[-5]*100 if cl1m[-5]>0 else 0
+                accel = mom1-mom2
+                if accel > 0.08: long_pts+=15; reasons_long.append(f'Accélération +{accel:.2f}%')
+                elif accel > 0.04: long_pts+=8
+                elif accel < -0.08: short_pts+=15; reasons_short.append(f'Accélération -{abs(accel):.2f}%')
+                elif accel < -0.04: short_pts+=8
+        except: pass
 
-        # ── 12. VOLATILITÉ RELATIVE (max 8 pts, malus si trop volatile) ─
-        a = atr(raw5m)
-        atr_pct = (a / price * 100) if price > 0 else 0
-        if atr_pct > 5:
-            long_pts  -= 15; short_pts -= 15  # trop volatile = imprévisible
-        elif atr_pct > 3:
-            long_pts  -= 8;  short_pts -= 8
-        elif 0.5 < atr_pct < 2:
-            long_pts  += 8;  short_pts += 8   # volatilité idéale
+        # 5. BREAKOUT CONSOLIDATION
+        try:
+            if len(cl15m) >= 20:
+                rec_hi = max(cl15m[-20:-1]); rec_lo = min(cl15m[-20:-1])
+                rng_pct = (rec_hi-rec_lo)/rec_lo*100 if rec_lo>0 else 99
+                cur = cl15m[-1]
+                if rng_pct < 5:
+                    if cur > rec_hi*1.003: long_pts+=20; reasons_long.append('Breakout consolidation')
+                    elif cur < rec_lo*0.997: short_pts+=20; reasons_short.append('Breakdown consolidation')
+                elif rng_pct < 10:
+                    if cur > rec_hi*1.003: long_pts+=12
+                    elif cur < rec_lo*0.997: short_pts+=12
+        except: pass
 
-        # ── MALUS GÉNÉRAUX ───────────────────────────────────────────────
-        if chg24 > 25 and long_pts > short_pts:  long_pts  -= 20  # déjà trop pumpé
-        if chg24 < -25 and short_pts > long_pts: short_pts -= 20  # déjà trop dumped
+        # 6. RANGE 24H
+        try:
+            if high24 > low24:
+                pos_r = (price-low24)/(high24-low24)
+                if pos_r < 0.20: long_pts+=12; reasons_long.append(f'Bas du range 24h ({pos_r*100:.0f}%)')
+                elif pos_r < 0.35: long_pts+=7
+                elif pos_r > 0.80: short_pts+=12; reasons_short.append(f'Haut du range 24h ({pos_r*100:.0f}%)')
+                elif pos_r > 0.65: short_pts+=7
+        except: pass
 
-        # ── DÉCISION FINALE ──────────────────────────────────────────────
-        if long_pts <= 0 and short_pts <= 0:
-            return None  # pas de signal
+        # 7. FUNDING RATE
+        try:
+            fund = get_funding(sym)
+            if isinstance(fund, (int, float)):
+                if fund < -0.03: long_pts+=12; reasons_long.append(f'Funding {fund:.3f}%')
+                elif fund < -0.01: long_pts+=6
+                elif fund > 0.03: short_pts+=12; reasons_short.append(f'Funding {fund:.3f}%')
+                elif fund > 0.01: short_pts+=6
+        except: pass
 
+        # 8. ORDER BOOK
+        try:
+            imbalance = get_orderbook_imbalance(sym)
+            if isinstance(imbalance, (int, float)):
+                if imbalance > 2.5: long_pts+=15; reasons_long.append(f'Carnet {imbalance:.1f}x acheteurs')
+                elif imbalance > 1.6: long_pts+=8
+                elif imbalance < 0.4: short_pts+=15; reasons_short.append('Carnet vendeurs')
+                elif imbalance < 0.6: short_pts+=8
+        except: pass
+
+        # 9. ATR VOLATILITÉ
+        try:
+            a = atr(raw5m)
+            atr_pct = (a/price*100) if price>0 else 0
+            if atr_pct > 5: long_pts-=15; short_pts-=15
+            elif atr_pct > 3: long_pts-=8; short_pts-=8
+            elif 0.5 < atr_pct < 2: long_pts+=8; short_pts+=8
+        except: pass
+
+        # MALUS GÉNÉRAUX
+        if chg24 > 25 and long_pts > short_pts: long_pts-=20
+        if chg24 < -25 and short_pts > long_pts: short_pts-=20
+
+        # DÉCISION
+        if long_pts <= 0 and short_pts <= 0: return None
         if long_pts >= short_pts:
-            direction = 'long'
-            score = min(100, max(0, round(long_pts)))
-            reasons = reasons_long[:4]
+            direction = 'long'; score = min(100, max(0, round(long_pts))); reasons = reasons_long[:4]
         else:
-            direction = 'short'
-            score = min(100, max(0, round(short_pts)))
-            reasons = reasons_short[:4]
-
-        if score < MIN_SCORE:
-            return None
+            direction = 'short'; score = min(100, max(0, round(short_pts))); reasons = reasons_short[:4]
+        if score < MIN_SCORE: return None
 
         return {
-            'score':     score,
-            'direction': direction,
-            'reasons':   reasons,
-            'atr_pct':   round(atr_pct, 3),
-            'vol_spike': round(vs, 2),
-            'rsi_1m':    round(r1m, 1),
-            'rsi_5m':    round(r5m, 1),
-            'rsi_15m':   round(r15m, 1),
-            'funding':   round(fund, 4),
-            'chg24':     round(chg24, 2),
-            'long_pts':  long_pts,
-            'short_pts': short_pts,
-            'symbol':    sym,
-            'macd':      round(mh5m, 6),  # macd_hist value
+            'score': score, 'direction': direction, 'reasons': reasons,
+            'rsi_1m': round(r1m,1), 'rsi_5m': round(r5m,1), 'rsi_15m': round(r15m,1),
+            'macd': round(mh5m if 'mh5m' in dir() else 0, 6),
+            'long_pts': long_pts, 'short_pts': short_pts, 'symbol': sym,
         }
     except Exception as e:
-        import traceback
-        log.warning(f'Score error {sym}: {e} | {traceback.format_exc().splitlines()[-1]}')
+        import traceback as _tb
+        log.warning(f'Score error {sym}: {e} | {_tb.format_exc().splitlines()[-1]}')
         return None
+
 
 # Cache OI pour comparer
 state_oi_cache = {}
