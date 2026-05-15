@@ -589,9 +589,24 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
         def lo(c): return [float(x[3]) for x in c] if c else []
         def vo(c): return [float(x[5]) for x in c] if c else []
 
-        cl1m  = cl(c1m);  cl5m = cl(c5m)
-        cl15m = cl(c15m); cl1h = cl(c1h)
-        cl4h  = cl(c4h) if c4h else cl1h
+        # Defensive: ensure candle lists are valid
+        def safe_cl(candles):
+            if not candles or not isinstance(candles, list):
+                return []
+            result = []
+            for x in candles:
+                try:
+                    if isinstance(x, (list, tuple)) and len(x) > 4:
+                        result.append(float(x[4]))
+                    elif isinstance(x, (int, float)):
+                        pass  # skip bare floats
+                except:
+                    pass
+            return result
+
+        cl1m  = safe_cl(c1m);  cl5m = safe_cl(c5m)
+        cl15m = safe_cl(c15m); cl1h = safe_cl(c1h)
+        cl4h  = safe_cl(c4h) if c4h else cl1h
         hi5m  = hi(c5m);  lo5m = lo(c5m)
         vo5m  = vo(c5m);  vo1m = vo(c1m)
 
@@ -893,7 +908,8 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
             'macd':      round(mh5m, 6),  # macd_hist value
         }
     except Exception as e:
-        log.warning(f'Score error {sym}: {e}')
+        import traceback
+        log.warning(f'Score error {sym}: {e} | {traceback.format_exc().splitlines()[-1]}')
         return None
 
 # Cache OI pour comparer
@@ -2233,5 +2249,3 @@ def trend_ok(closes_1h, direction):
             return True, 50
         else:
             return False, 0  # Prix au-dessus des EMAs = tendance haussière
-
-
