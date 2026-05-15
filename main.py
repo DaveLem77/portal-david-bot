@@ -347,7 +347,10 @@ def get_candles(symbol, gran, limit=100):
         'granularity': gran, 'limit': str(limit)
     })
     if r.get('code') == '00000':
-        return r.get('data', [])
+        data = r.get('data', [])
+        # Garantir que c'est toujours une liste de listes
+        if not isinstance(data, list): return []
+        return data
     return []
 
 def get_funding(symbol):
@@ -603,17 +606,25 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
             return None
 
         def cl(c): return [float(x[4]) for x in c] if c else []
-        def hi(c): return [float(x[2]) for x in c] if c else []
-        def lo(c): return [float(x[3]) for x in c] if c else []
-        def vo(c): return [float(x[5]) for x in c] if c else []
+        def hi(c):
+            if not c or not isinstance(c, list): return []
+            return [float(x.get('h',x[2]) if isinstance(x,dict) else x[2]) for x in c if isinstance(x,(dict,list,tuple))]
+        def lo(c):
+            if not c: return []
+            return [float(x.get('l',x[3]) if isinstance(x,dict) else x[3]) for x in c if isinstance(x,(dict,list,tuple))]
+        def vo(c):
+            if not c: return []
+            return [float(x.get('v',x[5]) if isinstance(x,dict) else x[5]) for x in c if isinstance(x,(dict,list,tuple)) and len(x)>5]
 
-        # Defensive: extract close prices from raw candles
+        # Defensive: extract close prices from raw candles (handles list AND dict format)
         def safe_cl(candles):
             if not candles or not isinstance(candles, list): return []
             result = []
             for x in candles:
                 try:
-                    if isinstance(x, (list, tuple)) and len(x) > 4:
+                    if isinstance(x, dict):
+                        result.append(float(x.get('c', x.get('close', 0))))
+                    elif isinstance(x, (list, tuple)) and len(x) > 4:
                         result.append(float(x[4]))
                 except: pass
             return result
@@ -623,7 +634,13 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
         cl15m = safe_cl(c15m); cl1h = safe_cl(c1h)
         cl4h  = safe_cl(c4h) if c4h else cl1h
         # Raw candles for functions that need OHLCV
-        raw5m = [x for x in (c5m or []) if isinstance(x, (list,tuple)) and len(x)>5]
+        # raw5m: normalize to list format for vol_spike/atr
+        def to_raw(x):
+            if isinstance(x, dict): return [x.get('ts',0),x.get('o',0),x.get('h',0),x.get('l',0),x.get('c',0),x.get('v',0)]
+            if isinstance(x,(list,tuple)) and len(x)>5: return list(x)
+            return None
+        c5m_safe = c5m if isinstance(c5m, list) else []
+        raw5m = [r for r in [to_raw(x) for x in c5m_safe] if r is not None]
         hi5m  = hi(c5m);  lo5m = lo(c5m)
         vo5m  = vo(c5m);  vo1m = vo(c1m)
 
