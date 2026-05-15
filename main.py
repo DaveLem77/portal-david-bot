@@ -1578,6 +1578,8 @@ def scan(state):
         return state
 
     state['last_scan'] = datetime.now(timezone.utc).isoformat()
+    if not state.get('position'):
+        state['status'] = f'Scan #{state.get("_scan_count",0)} en cours...'
     # Refresh CAD rate every ~1h (120 scans × 30s)
     state['_scan_count'] = state.get('_scan_count', 0) + 1
     if state['_scan_count'] % 120 == 0:
@@ -1683,15 +1685,16 @@ def scan(state):
 
         state['signals_checked'] = state.get('signals_checked', 0) + 1
 
-        c1m  = get_candles(sym, '1m', 100); time.sleep(0.07)
-        c5m  = get_candles(sym, '5m', 100); time.sleep(0.07)
-        c15m = get_candles(sym, '15m', 60); time.sleep(0.07)
-        c1h  = get_candles(sym, '1H', 50);  time.sleep(0.07)
-        c4h  = get_candles(sym, '4H', 30);  time.sleep(0.07)
+        c1m  = get_candles(sym, '1m', 60); time.sleep(0.03)
+        c5m  = get_candles(sym, '5m', 60); time.sleep(0.03)
+        c15m = get_candles(sym, '15m', 40); time.sleep(0.03)
+        c1h  = get_candles(sym, '1H', 50);  time.sleep(0.03)
+        c4h  = get_candles(sym, '4H', 30);  time.sleep(0.02)
         res = score_token(tk, c1m, c5m, c15m, c1h, weights, c4h)
         if res and res['score'] >= MIN_SCORE:
             candidates.append({'symbol': sym, **res})
             log.info(f'Candidate: {sym} score={res["score"]} dir={res["direction"]}')
+            state['status'] = f'Signal fort: {sym} {res["direction"].upper()} {res["score"]}/100'
 
     state['status'] = f'Scan terminé — {len(candidates)} signaux sur {len(top)} paires'
 
