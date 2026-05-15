@@ -529,20 +529,38 @@ def macd_hist(closes):
     return ml[-1] - sig[-1]
 
 def atr(candles, n=14):
-    if len(candles) < n + 1: return 0.0
-    trs = []
-    for i in range(1, len(candles)):
-        h  = float(candles[i][2])
-        l  = float(candles[i][3])
-        pc = float(candles[i-1][4])
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return sum(trs[-n:]) / n
+    try:
+        if not candles or not isinstance(candles, list) or len(candles) < n + 1: return 0.0
+        trs = []
+        prev_c = None
+        for c in candles:
+            if not isinstance(c, (list, tuple)) or len(c) < 5: continue
+            try:
+                h = float(c[2]); l = float(c[3]); cl = float(c[4])
+                if prev_c is not None:
+                    tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+                else:
+                    tr = h - l
+                trs.append(tr)
+                prev_c = cl
+            except: pass
+        if not trs: return 0.0
+        return sum(trs[-n:]) / min(len(trs), n)
+    except: return 0.0
+
 
 def vol_spike(candles, n=20):
-    if len(candles) < n + 1: return 1.0
-    vols = [float(c[5]) for c in candles]
-    avg  = sum(vols[-n-1:-1]) / n
-    return vols[-1] / avg if avg > 0 else 1.0
+    try:
+        if not candles or not isinstance(candles, list) or len(candles) < n + 1: return 1.0
+        vols = []
+        for c in candles:
+            if isinstance(c, (list, tuple)) and len(c) > 5:
+                try: vols.append(float(c[5]))
+                except: pass
+        if len(vols) < n + 1: return 1.0
+        avg = sum(vols[-n-1:-1]) / n
+        return vols[-1] / avg if avg > 0 else 1.0
+    except: return 1.0
 
 # ══ SCORING ════════════════════════════════════════════════════════════
 
@@ -589,24 +607,23 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
         def lo(c): return [float(x[3]) for x in c] if c else []
         def vo(c): return [float(x[5]) for x in c] if c else []
 
-        # Defensive: ensure candle lists are valid
+        # Defensive: extract close prices from raw candles
         def safe_cl(candles):
-            if not candles or not isinstance(candles, list):
-                return []
+            if not candles or not isinstance(candles, list): return []
             result = []
             for x in candles:
                 try:
                     if isinstance(x, (list, tuple)) and len(x) > 4:
                         result.append(float(x[4]))
-                    elif isinstance(x, (int, float)):
-                        pass  # skip bare floats
-                except:
-                    pass
+                except: pass
             return result
 
+        # Keep raw candles for vol_spike/atr, use safe_cl for RSI/MACD
         cl1m  = safe_cl(c1m);  cl5m = safe_cl(c5m)
         cl15m = safe_cl(c15m); cl1h = safe_cl(c1h)
         cl4h  = safe_cl(c4h) if c4h else cl1h
+        # Raw candles for functions that need OHLCV
+        raw5m = [x for x in (c5m or []) if isinstance(x, (list,tuple)) and len(x)>5]
         hi5m  = hi(c5m);  lo5m = lo(c5m)
         vo5m  = vo(c5m);  vo1m = vo(c1m)
 
@@ -694,7 +711,7 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
         # ── 3. VOLUME ANOMALY DETECTION (max 18 pts) ────────────────────
         # Signal original: détecter l'accumulation silencieuse
         # Volume croissant sur 3 bougies = gros acteur qui rentre
-        vs = vol_spike(c5m)
+        vs = vol_spike(raw5m)
         if vs > 5:
             # Volume explosif — direction du mouvement associé
             if len(cl5m) >= 2 and cl5m[-1] > cl5m[-2]:
@@ -839,10 +856,10 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
 
         # ── 11. MICRO-STRUCTURE PRIX (signal original) (max 12 pts) ────
         # Analyse des mèches des bougies — révèle les intentions cachées
-        if len(c5m) >= 5:
+        if len(raw5m) >= 5:
             upper_wicks = []  # mèches hautes = rejet vendeurs
             lower_wicks = []  # mèches basses = rejet acheteurs
-            for candle in c5m[-5:]:
+            for candle in raw5m[-5:]:
                 try:
                     o,h,l,c_,v = float(candle[1]),float(candle[2]),float(candle[3]),float(candle[4]),float(candle[5])
                     body_top = max(o,c_); body_bot = min(o,c_)
@@ -862,7 +879,7 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
                     short_pts += 12; reasons_short.append('Mèches hautes: vendeurs défendent')
 
         # ── 12. VOLATILITÉ RELATIVE (max 8 pts, malus si trop volatile) ─
-        a = atr(c5m)
+        a = atr(raw5m)
         atr_pct = (a / price * 100) if price > 0 else 0
         if atr_pct > 5:
             long_pts  -= 15; short_pts -= 15  # trop volatile = imprévisible
