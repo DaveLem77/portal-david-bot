@@ -130,7 +130,7 @@ DÉCIDE maintenant. JSON uniquement:
 
     try:
         body = _json.dumps({
-            'model': 'claude-sonnet-4-20250514',
+            'model': 'claude-sonnet-4-5',
             'max_tokens': 150,
             'messages': [{'role': 'user', 'content': prompt}]
         }).encode()
@@ -177,7 +177,7 @@ DÉCIDE maintenant. JSON uniquement:
 
     return {'action': 'HOLD' if context=='manage' else 'ENTER', 'reason': 'AI unavailable', 'confidence': 60}
 
-STATE_FILE = '/tmp/pdv4.json'  # v4 — nouveau départ 175$
+STATE_FILE = '/tmp/pdv5.json'  # v5 — reset 175$  # v4 — nouveau départ 175$
 
 def _handle_sigterm(signum, frame):
     """Sauvegarde l'état avant que Render tue le process"""
@@ -230,7 +230,7 @@ def empty_state():
         'status':            'Démarrage…',
         'balance':           175.0,
         'balance_total':     175.0,
-        'initial_balance':   94.36,
+        'initial_balance':   175.0,
         'position':          None,
         'history':           [],
         'total_pnl':         0.0,
@@ -1748,11 +1748,14 @@ def scan(state):
     ai_conf   = ai_verdict.get('confidence', 0)
     ai_reason = ai_verdict.get('reason', '')
 
-    # Si AI indisponible ou pas confiant → on n'entre PAS
+    # Si AI indisponible → entrer quand même si score >= 85
     if ai_reason == 'AI unavailable':
-        log.info(f'AI indisponible — trade annulé par sécurité')
-        state['status'] = f'AI indisponible — trade annulé: {best["symbol"]}'
-        return state
+        if best['score'] >= 85:
+            log.info(f'AI indisponible mais score={best["score"]} >= 85 — trade approuvé')
+        else:
+            log.info(f'AI indisponible et score={best["score"]} < 85 — trade annulé')
+            state['status'] = f'AI indisponible — score insuffisant: {best["symbol"]}'
+            return state
 
     if ai_action != 'ENTER':
         log.info(f'AI REJECTED: {ai_reason} (conf={ai_conf})')
