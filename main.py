@@ -2233,3 +2233,5 @@ def trend_ok(closes_1h, direction):
             return True, 50
         else:
             return False, 0  # Prix au-dessus des EMAs = tendance haussière
+
+
