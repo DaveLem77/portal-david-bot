@@ -18,10 +18,10 @@ PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', '')
 BASE       = 'https://api.bitget.com'
 
 LEVERAGE      = 15       # levier de base (sera overridé dynamiquement)
-RISK_PCT      = 0.55     # 55% du capital par trade
+RISK_PCT      = 0.70     # 70% de marge par trade
 TP_PCT        = 0.025    # take profit +2.5% — proche et réaliste
 SL_PCT        = 0.020    # stop loss -2% — serré mais IA sort avant si nécessaire
-MIN_SCORE     = 75       # score minimum — très sélectif
+MIN_SCORE     = 90       # score minimum — seulement les trades parfaits
 SCAN_SEC      = 30       # scan toutes les 30 secondes
 MIN_VOL_24H   = 8_000_000  # volume minimum USDT
 
@@ -155,7 +155,25 @@ DÉCIDE maintenant. JSON uniquement:
                 log.info(f'AI decision [{context}]: {result.get("action")} — {result.get("reason","")} (conf={result.get("confidence")})')
                 return result
     except Exception as e:
-        log.warning(f'AI decision failed: {e}')
+        err_str = str(e)
+        if '529' in err_str:
+            # Anthropic surchargé — réessayer une fois après 3 secondes
+            log.warning(f'AI 529 — retry in 3s')
+            try:
+                time.sleep(3)
+                with _ur.urlopen(req, timeout=8) as resp:
+                    data = _json.loads(resp.read())
+                    text = data['content'][0]['text'].strip()
+                    import re as _re
+                    m = _re.search(r'\{.*?\}', text, _re.DOTALL)
+                    if m:
+                        result = _json.loads(m.group())
+                        log.info(f'AI retry OK: {result.get("action")}')
+                        return result
+            except Exception as e2:
+                log.warning(f'AI retry failed: {e2}')
+        else:
+            log.warning(f'AI decision failed: {e}')
 
     return {'action': 'HOLD' if context=='manage' else 'ENTER', 'reason': 'AI unavailable', 'confidence': 60}
 
@@ -611,11 +629,29 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
         if r1h < 32:   short_pts -= 20  # survente 1h → danger short
         elif r1h > 50: short_pts += 10
 
-        # FILTRE 4H — tendance majeure
+        # FILTRE 4H RSI
+        r4h = rsi(cl4h)
         if r4h > 72:   long_pts  -= 25
         elif r4h < 55: long_pts  += 8
         if r4h < 28:   short_pts -= 25
         elif r4h > 45: short_pts += 8
+
+        # ── FILTRE EMA TENDANCE 1H — CRITIQUE ───────────────────────────
+        # RSI survendu dans tendance baissière = piège. EMA filtre ça.
+        dir_test = 'long' if long_pts >= short_pts else 'short'
+        trend_valid, trend_force = trend_ok(cl1h, dir_test)
+        if not trend_valid:
+            if dir_test == 'long':
+                long_pts -= 40
+                reasons_long.append('BLOQUÉ: contre-tendance EMA 1H')
+            else:
+                short_pts -= 40
+                reasons_short.append('BLOQUÉ: contre-tendance EMA 1H')
+        elif trend_force >= 70:
+            if dir_test == 'long':
+                long_pts += 15; reasons_long.append('EMA haussière confirmée')
+            else:
+                short_pts += 15; reasons_short.append('EMA baissière confirmée')
 
         # ── 2. MACD MOMENTUM (max 20 pts) ───────────────────────────────
         mh1m  = macd_hist(cl1m)
@@ -1063,15 +1099,18 @@ def place_order(symbol, direction, balance, scored, state_balance_info=None):
                     break
             if real_liq > 0:
                 if direction == 'long':
-                    safe_sl = round(real_liq * 1.035, price_dec)
-                    sl_price_final = max(sl_price, safe_sl)
-                    if sl_price_final != sl_price:
-                        log.info(f'SL moved above liq: {sl_price} -> {sl_price_final}')
+                    # LONG: SL doit être SOUS l'entrée, juste au-dessus de la liquidation
+                    # liq=117.80, entry=120.20 → SL doit être entre 117.80 et 120.20
+                    min_sl = round(real_liq * 1.015, price_dec)  # 1.5% au-dessus de liq
+                    max_sl = round(ep * 0.998, price_dec)          # max 0.2% sous l'entrée
+                    sl_price_final = max(min_sl, min(sl_price, max_sl))
+                    log.info(f'SL LONG: liq={real_liq} entry={ep} sl={sl_price_final}')
                 else:
-                    safe_sl = round(real_liq * 0.965, price_dec)
-                    sl_price_final = min(sl_price, safe_sl)
-                    if sl_price_final != sl_price:
-                        log.info(f'SL moved below liq: {sl_price} -> {sl_price_final}')
+                    # SHORT: SL doit être AU-DESSUS de l'entrée, juste sous la liquidation
+                    max_sl = round(real_liq * 0.985, price_dec)   # 1.5% sous liq
+                    min_sl = round(ep * 1.002, price_dec)          # min 0.2% au-dessus entrée
+                    sl_price_final = min(max_sl, max(sl_price, min_sl))
+                    log.info(f'SL SHORT: liq={real_liq} entry={ep} sl={sl_price_final}')
         except Exception as e:
             log.warning(f'Liq fetch failed: {e}')
 
@@ -1192,19 +1231,20 @@ def check_position(state):
     pos  = next((p for p in positions if p['symbol'] == sym), None)
 
     if not pos:
-        # Position fermée — on compare avec le solde précédent
+        # Position fermée — PNL = unrealizedPnl au moment de la fermeture
         time.sleep(1.0)
         bal_new = get_balance()
-        old_bal = state['balance']
-        pnl     = round(bal_new - old_bal, 6)
-
-        log.info(f'Position closed. Old bal={old_bal} New bal={bal_new} PNL={pnl}')
+        # Utiliser le vrai PNL depuis Bitget, pas la diff de solde (qui inclut la marge)
+        pnl = round(state['position'].get('unrealizedPnl', 0), 6)
+        margin = state['position'].get('margin', 1)
+        pnl_pct = round((pnl / max(margin, 0.01)) * 100, 2)
+        log.info(f'Position closed. PNL={pnl} ({pnl_pct}%) NewBal={bal_new}')
 
         record = {
             **state['position'],
             'closeTime':    datetime.now(timezone.utc).isoformat(),
             'pnl':          pnl,
-            'pnlPct':       round((pnl / max(state['position'].get('margin', 1), 0.01)) * 100, 2),
+            'pnlPct':       pnl_pct,
             'closeBalance': round(bal_new, 6),
             'exitReason':   'TP/SL auto',
         }
@@ -1288,7 +1328,9 @@ def check_position(state):
 
         # ── DÉCISION IA — toutes les 90 secondes (3 scans) ──────────────
         state['_ai_scan_count'] = state.get('_ai_scan_count', 0) + 1
-        if state['_ai_scan_count'] % 3 == 0:
+        ai_interval = state.get('_ai_fail_count', 0) * 2 + 3  # 3, 5, 7... max 15
+        ai_interval = min(ai_interval, 15)
+        if state['_ai_scan_count'] % ai_interval == 0:
             try:
                 c1m_ai = get_candles(sym, '1m', 20)
                 c1m_btc = get_candles('BTCUSDT', '1m', 10)
@@ -1313,6 +1355,10 @@ def check_position(state):
                 state['ai_live_action']  = action
                 state['ai_live_ts']      = _ts
                 log.info(f'AI stored in S: action={action} msg={reason[:60]}')
+                if reason != 'AI unavailable':
+                    state['_ai_fail_count'] = 0  # reset backoff
+                else:
+                    state['_ai_fail_count'] = state.get('_ai_fail_count', 0) + 1
                 # Persister immédiatement pour que /api/ai-status le lise
                 try:
                     save_state(S)
@@ -1526,17 +1572,41 @@ def detect_manual_close(state):
     still_open = any(p['symbol'] == sym for p in positions)
 
     if not still_open:
-        log.info('Manual close detected')
-        bal_new = get_balance()
-        pnl     = round(bal_new - state['balance'], 6)
+        bal_new  = get_balance()
+        margin   = state['position'].get('margin', 1)
+        ep       = state['position'].get('entryPrice', 0)
+        tp       = state['position'].get('tp', 0)
+        sl       = state['position'].get('sl', 0)
+        cp       = state['position'].get('currentPrice', ep)
+        dirp     = state['position'].get('direction', 'long')
+        unr      = state['position'].get('unrealizedPnl', 0)
+
+        # Déterminer la vraie raison de fermeture
+        # Si le PNL non réalisé était proche du TP ou SL → auto, sinon manuel
+        pnl = round(unr, 6)  # Utiliser le dernier PNL connu
+        if dirp == 'long':
+            near_tp = tp > 0 and cp >= tp * 0.998
+            near_sl = sl > 0 and cp <= sl * 1.002
+        else:
+            near_tp = tp > 0 and cp <= tp * 1.002
+            near_sl = sl > 0 and cp >= sl * 0.998
+
+        if near_tp:
+            exit_reason = 'TP atteint'
+        elif near_sl:
+            exit_reason = 'SL atteint'
+        else:
+            exit_reason = 'Fermé manuellement'
+
+        log.info(f'Position closed: {exit_reason} | PNL={pnl} | cp={cp} tp={tp} sl={sl}')
 
         record = {
             **state['position'],
             'closeTime':    datetime.now(timezone.utc).isoformat(),
             'pnl':          pnl,
-            'pnlPct':       round((pnl / max(state['position'].get('margin', 1), 0.01)) * 100, 2),
+            'pnlPct':       round((pnl / max(margin, 0.01)) * 100, 2),
             'closeBalance': round(bal_new, 6),
-            'exitReason':   'Fermé manuellement',
+            'exitReason':   exit_reason,
         }
         state['history'].insert(0, record)
         if len(state['history']) > 200:
@@ -1561,11 +1631,11 @@ def detect_manual_close(state):
         state['position']      = None
         state['balance']       = round(bal_new, 6)
         state['balance_total'] = round(bal_new, 6)
-        state['status']        = f'Ferme manuellement — PNL: {pnl:+.4f} USDT'
+        state['status']        = f'{exit_reason} — PNL: {pnl:+.4f} USDT'
         emoji = 'GAIN' if pnl > 0 else 'PERTE'
         send_sms(
             f'PORTAL DAVID - Trade ferme\n'
-            f'{emoji}: {pnl:+.4f} USDT (manuel)\n'
+            f'{emoji}: {pnl:+.4f} USDT ({exit_reason})\n'
             f'Nouveau solde: ${bal_new:.2f}'
         )
         state = update_weights(state)
@@ -1727,6 +1797,16 @@ def scan(state):
     if consensus:
         log.info(f'Consensus détecté: {len(same_dir)} cryptos en {best["direction"]} — boost levier')
 
+    # Cooldown 5 min entre trades
+    last_tt = state.get('last_trade_time', '')
+    if last_tt:
+        try:
+            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_tt)).total_seconds()
+            if elapsed < 300:
+                state['status'] = f'Cooldown {int(300-elapsed)}s — patience'
+                return state
+        except: pass
+
     log.info(f'Best: {best["symbol"]} score={best["score"]} dir={best["direction"]} consensus={consensus}')
 
     # ── VALIDATION IA AVANT ENTRÉE ────────────────────────────────────────
@@ -1753,12 +1833,27 @@ def scan(state):
 
     ai_verdict = ai_trade_decision(state, c1m_ai, rsi_info, macd_info, btc_change, context='entry')
 
-    if ai_verdict.get('action') == 'SKIP':
-        log.info(f'AI REJECTED trade: {ai_verdict.get("reason")} (conf={ai_verdict.get("confidence")})')
-        state['status'] = f'AI a refusé {best["symbol"]}: {ai_verdict.get("reason","")}'
+    ai_action = ai_verdict.get('action', 'SKIP')
+    ai_conf   = ai_verdict.get('confidence', 0)
+    ai_reason = ai_verdict.get('reason', '')
+
+    # Si AI indisponible ou pas confiant → on n'entre PAS
+    if ai_reason == 'AI unavailable':
+        log.info(f'AI indisponible — trade annulé par sécurité')
+        state['status'] = f'AI indisponible — trade annulé: {best["symbol"]}'
         return state
 
-    log.info(f'AI APPROVED entry: {ai_verdict.get("reason")} (conf={ai_verdict.get("confidence")})')
+    if ai_action != 'ENTER':
+        log.info(f'AI REJECTED: {ai_reason} (conf={ai_conf})')
+        state['status'] = f'AI a refusé {best["symbol"]}: {ai_reason}'
+        return state
+
+    if ai_conf < 70:
+        log.info(f'AI confiance trop faible: {ai_conf}% — trade annulé')
+        state['status'] = f'AI pas assez confiant ({ai_conf}%) — {best["symbol"]} annulé'
+        return state
+
+    log.info(f'AI APPROVED: {ai_reason} (conf={ai_conf}%)')
     state['status'] = f'Signal: {best["symbol"]} {best["direction"].upper()} score={best["score"]} — Ouverture…'
 
     pos = place_order(best['symbol'], best['direction'], state['balance'], best,
@@ -2081,3 +2176,51 @@ log.info('Bot thread launched')
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
+def ema(closes, period):
+    """Moyenne mobile exponentielle"""
+    if len(closes) < period:
+        return closes[-1] if closes else 0
+    k = 2 / (period + 1)
+    e = closes[0]
+    for c in closes[1:]:
+        e = c * k + e * (1 - k)
+    return e
+
+def trend_ok(closes_1h, direction):
+    """
+    Vérifie que la tendance 1H confirme la direction.
+    LONG: prix au-dessus EMA21 ET EMA21 > EMA50
+    SHORT: prix en dessous EMA21 ET EMA21 < EMA50
+    Retourne (ok, force) où force = 0-100
+    """
+    if len(closes_1h) < 50:
+        return True, 50  # Pas assez de données, laisser passer
+    
+    e21 = ema(closes_1h, 21)
+    e50 = ema(closes_1h, 50)
+    price = closes_1h[-1]
+    
+    if direction == 'long':
+        # Pour un LONG: prix > EMA21 > EMA50 = tendance haussière confirmée
+        price_above_e21 = price > e21
+        e21_above_e50 = e21 > e50
+        
+        if price_above_e21 and e21_above_e50:
+            force = min(100, int((e21 - e50) / e50 * 10000))
+            return True, 70 + min(30, force)
+        elif price_above_e21 or e21_above_e50:
+            return True, 50  # Tendance mixte — score neutre
+        else:
+            return False, 0  # Prix sous les deux EMAs = tendance baissière
+    else:
+        # Pour un SHORT: prix < EMA21 < EMA50 = tendance baissière confirmée
+        price_below_e21 = price < e21
+        e21_below_e50 = e21 < e50
+        
+        if price_below_e21 and e21_below_e50:
+            force = min(100, int((e50 - e21) / e50 * 10000))
+            return True, 70 + min(30, force)
+        elif price_below_e21 or e21_below_e50:
+            return True, 50
+        else:
+            return False, 0  # Prix au-dessus des EMAs = tendance haussière
