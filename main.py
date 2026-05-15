@@ -18,7 +18,7 @@ PASSPHRASE = os.environ.get('BITGET_PASSPHRASE', '')
 BASE       = 'https://api.bitget.com'
 
 LEVERAGE      = 15       # levier de base (sera overridé dynamiquement)
-RISK_PCT      = 0.70     # 70% de marge par trade
+RISK_PCT      = 0.65     # 65% de marge par trade
 TP_PCT        = 0.025    # take profit +2.5% — proche et réaliste
 SL_PCT        = 0.020    # stop loss -2% — serré mais IA sort avant si nécessaire
 MIN_SCORE     = 82       # score minimum — très sélectif mais réaliste 24h/24
@@ -1759,24 +1759,11 @@ def scan(state):
 
     if ai_action != 'ENTER':
         log.info(f'AI REJECTED: {ai_reason} (conf={ai_conf})')
-        # Essayer la direction opposée si l'autre score est aussi bon
-        opp_dir = 'short' if best['direction'] == 'long' else 'long'
-        opp_pts = best.get('short_pts' if opp_dir=='short' else 'long_pts', 0)
-        if opp_pts >= MIN_SCORE:
-            log.info(f'AI a rejeté {best["direction"]} — essai {opp_dir} (pts={opp_pts})')
-            best['direction'] = opp_dir
-            best['score'] = min(100, round(opp_pts))
-            # Re-valider avec l'IA pour la nouvelle direction
-            state['_pending_dir'] = opp_dir
-            state['_pending_score'] = best['score']
-            ai2 = ai_trade_decision(state, c1m_ai, rsi_info, macd_info, btc_change, context='entry')
-            if ai2.get('action') == 'ENTER' and ai2.get('confidence', 0) >= 70:
-                log.info(f'AI APPROVED opposite direction {opp_dir}')
-            else:
-                state['status'] = f'AI a refusé {best["symbol"]} dans les deux sens'
-                return state
+        # Score >= 88 avec conf < 78 → override l'IA — algo très confiant
+        if best['score'] >= 88 and ai_conf < 78:
+            log.info(f'OVERRIDE AI: score={best["score"]} >= 88 et conf={ai_conf} < 78 — entrée forcée')
         else:
-            state['status'] = f'AI a refusé {best["symbol"]}: {ai_reason}'
+            state['status'] = f'AI a refusé {best["symbol"]}: {ai_reason[:60]}'
             return state
 
     if ai_conf < 70:
