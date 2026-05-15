@@ -554,7 +554,10 @@ def get_liquidations(symbol):
             'productType': 'USDT-FUTURES',
         })
         longs = 0; shorts = 0
-        for item in (r.get('data') or []):
+        data = r.get('data') or []
+        if not isinstance(data, list): data = []
+        for item in data:
+            if not isinstance(item, dict): continue
             side = item.get('side','')
             usd  = float(item.get('fillUsdtValue', 0))
             if side in ('sell','short'):  # long liquidé = vente forcée
@@ -639,7 +642,7 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
         # ── FILTRE EMA TENDANCE 1H — CRITIQUE ───────────────────────────
         # RSI survendu dans tendance baissière = piège. EMA filtre ça.
         dir_test = 'long' if long_pts >= short_pts else 'short'
-        trend_valid, trend_force = trend_ok(cl1h, dir_test)
+        trend_valid, trend_force = trend_ok(cl1h if isinstance(cl1h, list) else [], dir_test)
         if not trend_valid:
             if dir_test == 'long':
                 long_pts -= 40
@@ -796,7 +799,13 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
         # OI qui monte avec le prix = confirmation. OI qui monte contre prix = divergence danger
         try:
             oi_r = GET('/api/v2/mix/market/open-interest', {'symbol': sym, 'productType': 'USDT-FUTURES'})
-            oi_val = float((oi_r.get('data') or [{}])[0].get('size', 0)) if oi_r.get('data') else 0
+            oi_data = oi_r.get('data')
+            if isinstance(oi_data, list) and oi_data:
+                oi_val = float(oi_data[0].get('size', 0))
+            elif isinstance(oi_data, dict):
+                oi_val = float(oi_data.get('size', 0))
+            else:
+                oi_val = 0
             oi_prev = float(state_oi_cache.get(sym, oi_val))
             state_oi_cache[sym] = oi_val
             oi_change = (oi_val - oi_prev) / oi_prev * 100 if oi_prev > 0 else 0
@@ -2178,7 +2187,7 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=port)
 def ema(closes, period):
     """Moyenne mobile exponentielle"""
-    if len(closes) < period:
+    if not isinstance(closes, list) or len(closes) < period:
         return closes[-1] if closes else 0
     k = 2 / (period + 1)
     e = closes[0]
