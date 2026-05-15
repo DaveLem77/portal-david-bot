@@ -1974,6 +1974,24 @@ def api_ai_status():
         except: pass
     return cors_json({'message': msg, 'action': action, 'ts': ts})
 
+@app.route('/api/debug-candles')
+def api_debug_candles():
+    from flask import request as rq
+    sym = rq.args.get('symbol', 'BTCUSDT')
+    raw = GET('/api/v2/mix/market/candles', {
+        'symbol': sym, 'productType': 'USDT-FUTURES',
+        'granularity': '1m', 'limit': '3'
+    })
+    sample = raw.get('data', [])
+    first = sample[0] if sample else None
+    return cors_json({
+        'code': raw.get('code'),
+        'data_type': type(sample).__name__,
+        'first_type': type(first).__name__ if first else None,
+        'first': first,
+        'first_elem_type': type(first[0]).__name__ if isinstance(first, (list,tuple)) and first else None,
+    })
+
 @app.route('/api/health')
 def api_health():
     return cors_json({'ok': True, 'ts': datetime.now(timezone.utc).isoformat()})
