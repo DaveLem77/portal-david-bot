@@ -130,7 +130,7 @@ DÉCIDE maintenant. JSON uniquement:
 
     try:
         body = _json.dumps({
-            'model': 'claude-sonnet-4-5',
+            'model': 'claude-sonnet-4-20250514',
             'max_tokens': 150,
             'messages': [{'role': 'user', 'content': prompt}]
         }).encode()
@@ -1313,6 +1313,10 @@ def check_position(state):
                 state['ai_live_action']  = action
                 state['ai_live_ts']      = _ts
                 log.info(f'AI stored in S: action={action} msg={reason[:60]}')
+                # Persister immédiatement pour que /api/ai-status le lise
+                try:
+                    save_state(S)
+                except: pass
 
                 if action == 'EXIT_NOW':
                     log.info(f'AI says EXIT: {ai_dec.get("reason")}')
@@ -1803,11 +1807,18 @@ def api_ai_status():
     global S
     if flask_req.method == 'OPTIONS':
         return cors_json({})
-    return cors_json({
-        'message': S.get('ai_live_message', ''),
-        'action':  S.get('ai_live_action', 'HOLD'),
-        'ts':      S.get('ai_live_ts', ''),
-    })
+    # Lire depuis S en priorité, sinon depuis le fichier sauvegardé
+    msg    = S.get('ai_live_message', '')
+    action = S.get('ai_live_action', 'HOLD')
+    ts     = S.get('ai_live_ts', '')
+    if not msg:
+        try:
+            saved = load_state()
+            msg    = saved.get('ai_live_message', '')
+            action = saved.get('ai_live_action', 'HOLD')
+            ts     = saved.get('ai_live_ts', '')
+        except: pass
+    return cors_json({'message': msg, 'action': action, 'ts': ts})
 
 @app.route('/api/health')
 def api_health():
