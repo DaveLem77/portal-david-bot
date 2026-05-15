@@ -354,13 +354,18 @@ def get_candles(symbol, gran, limit=100):
     return []
 
 def get_funding(symbol):
-    r = GET('/api/v2/mix/market/current-fund-rate', {
-        'symbol': symbol, 'productType': 'USDT-FUTURES'
-    })
     try:
-        return float(r['data'][0].get('fundingRate', 0)) * 100
+        r = GET('/api/v2/mix/market/current-fund-rate', {
+            'symbol': symbol, 'productType': 'USDT-FUTURES'
+        })
+        data = r.get('data', [])
+        if isinstance(data, list) and data:
+            return float(data[0].get('fundingRate', 0) or 0) * 100
+        elif isinstance(data, dict):
+            return float(data.get('fundingRate', 0) or 0) * 100
     except:
-        return 0.0
+        pass
+    return 0.0
 
 # ══ ADVANCED SIGNALS — ce que les autres bots ne font pas ══════════════
 
@@ -378,27 +383,21 @@ def get_open_interest(symbol):
     return 0.0
 
 def get_orderbook_imbalance(symbol):
-    """
-    Déséquilibre carnet d'ordres — si 3x plus d'achats que de ventes
-    dans le top 5 niveaux = pression d'achat forte
-    """
-    r = GET('/api/v2/mix/market/merge-depth', {
-        'symbol': symbol, 'productType': 'USDT-FUTURES',
-        'precision': 'scale0', 'limit': '10'
-    })
     try:
-        d    = r.get('data', {})
-        bids = d.get('bids', [])  # achats
-        asks = d.get('asks', [])  # ventes
-        if not bids or not asks:
-            return 0.0
-        bid_vol = sum(float(b[1]) for b in bids[:5])
-        ask_vol = sum(float(a[1]) for a in asks[:5])
-        if ask_vol == 0:
-            return 3.0
-        return bid_vol / ask_vol  # >1.5 = pression achat, <0.7 = pression vente
+        r = GET('/api/v2/mix/market/merge-depth', {
+            'symbol': symbol, 'productType': 'USDT-FUTURES', 'precision': 'scale0'
+        })
+        data = r.get('data', {})
+        if not isinstance(data, dict): return 1.0
+        bids = data.get('bids', [])
+        asks = data.get('asks', [])
+        if not isinstance(bids, list) or not isinstance(asks, list): return 1.0
+        bid_vol = sum(float(b[1]) for b in bids[:5] if isinstance(b, (list,tuple)) and len(b)>1)
+        ask_vol = sum(float(a[1]) for a in asks[:5] if isinstance(a, (list,tuple)) and len(a)>1)
+        return bid_vol / ask_vol if ask_vol > 0 else 1.0
     except:
         return 1.0
+
 
 def get_liquidation_data(symbol):
     """
@@ -568,26 +567,23 @@ def vol_spike(candles, n=20):
 # ══ SCORING ════════════════════════════════════════════════════════════
 
 def get_liquidations(symbol):
-    """Récupère les liquidations récentes — signal de retournement puissant"""
     try:
         r = GET('/api/v2/mix/market/liquidation-orders', {
-            'symbol': symbol,
-            'productType': 'USDT-FUTURES',
+            'symbol': symbol, 'productType': 'USDT-FUTURES'
         })
+        data = r.get('data', [])
+        if not isinstance(data, list): return None
         longs = 0; shorts = 0
-        data = r.get('data') or []
-        if not isinstance(data, list): data = []
         for item in data:
             if not isinstance(item, dict): continue
-            side = item.get('side','')
-            usd  = float(item.get('fillUsdtValue', 0))
-            if side in ('sell','short'):  # long liquidé = vente forcée
-                longs  += usd
-            elif side in ('buy','long'):  # short liquidé = achat forcé
-                shorts += usd
+            side = item.get('side', '')
+            usd = float(item.get('fillUsdtValue', 0) or 0)
+            if side in ('sell', 'short'): longs += usd
+            elif side in ('buy', 'long'): shorts += usd
         return {'long_usd': longs, 'short_usd': shorts}
     except:
         return None
+
 
 def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
     """Moteur de scoring v5 — 100% défensif contre les formats Bitget inattendus"""
