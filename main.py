@@ -21,7 +21,7 @@ LEVERAGE      = 15       # levier de base (sera overridé dynamiquement)
 RISK_PCT      = 0.70     # 70% de marge par trade
 TP_PCT        = 0.025    # take profit +2.5% — proche et réaliste
 SL_PCT        = 0.020    # stop loss -2% — serré mais IA sort avant si nécessaire
-MIN_SCORE     = 90       # score minimum — seulement les trades parfaits
+MIN_SCORE     = 82       # score minimum — très sélectif mais réaliste 24h/24
 SCAN_SEC      = 30       # scan toutes les 30 secondes
 MIN_VOL_24H   = 8_000_000  # volume minimum USDT
 
