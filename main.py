@@ -1182,6 +1182,7 @@ def place_order(symbol, direction, balance, scored, state_balance_info=None):
 
 # ══ CHECK POSITION ════════════════════════════════════════════════════
 def check_position(state):
+    global S  # Pour mettre à jour les messages IA dans le state global
     if not state['position']:
         return state
 
@@ -1335,24 +1336,82 @@ def check_position(state):
 
                 elif action in ('MOVE_SL', 'MOVE_BOTH'):
                     new_sl_ai = ai_dec.get('new_sl')
+                    # Si Claude ne donne pas de prix, utiliser breakeven
+                    if not new_sl_ai:
+                        new_sl_ai = state['position'].get('entryPrice', 0)
                     if new_sl_ai and isinstance(new_sl_ai, (int, float)):
-                        # Vérifier que le nouveau SL est dans le bon sens
-                        if dirp == 'long' and new_sl_ai > state['position'].get('sl', 0):
-                            log.info(f'AI MOVE SL: {state["position"]["sl"]} → {new_sl_ai}')
+                        cur_sl = state['position'].get('sl', 0)
+                        valid = (dirp=='long' and new_sl_ai > cur_sl) or (dirp=='short' and new_sl_ai < cur_sl)
+                        if valid:
+                            log.info(f'AI MOVE SL: {cur_sl} → {new_sl_ai}')
                             state['position']['sl'] = new_sl_ai
-                        elif dirp == 'short' and new_sl_ai < state['position'].get('sl', 999999):
-                            log.info(f'AI MOVE SL: {state["position"]["sl"]} → {new_sl_ai}')
-                            state['position']['sl'] = new_sl_ai
+                            # Annuler l'ancien SL sur Bitget et poser le nouveau
+                            try:
+                                hold_side = dirp
+                                # Annuler tous les SL existants
+                                existing = GET('/api/v2/mix/order/plan-delegateList', {
+                                    'symbol': sym, 'productType': 'USDT-FUTURES', 'planType': 'loss_plan', 'status': 'live'
+                                })
+                                for order in (existing.get('data', {}).get('entrustedList') or []):
+                                    oid = order.get('orderId', '')
+                                    if oid:
+                                        POST('/api/v2/mix/order/cancel-plan-order', {
+                                            'symbol': sym, 'productType': 'USDT-FUTURES', 'orderId': oid
+                                        })
+                                        time.sleep(0.15)
+                                # Poser le nouveau SL sur Bitget
+                                sz = state['position'].get('totalSize', 0)
+                                price_dec = len(str(new_sl_ai).split('.')[-1]) if '.' in str(new_sl_ai) else 0
+                                sl_r = POST('/api/v2/mix/order/place-tpsl-order', {
+                                    'symbol':       sym,
+                                    'productType':  'USDT-FUTURES',
+                                    'marginCoin':   'USDT',
+                                    'planType':     'loss_plan',
+                                    'triggerPrice': str(round(new_sl_ai, price_dec)),
+                                    'triggerType':  'mark_price',
+                                    'holdSide':     hold_side,
+                                    'size':         str(sz),
+                                })
+                                log.info(f'AI SL updated on Bitget: code={sl_r.get("code")} msg={sl_r.get("msg","")}')
+                            except Exception as e:
+                                log.warning(f'AI SL Bitget update failed: {e}')
 
                 elif action in ('MOVE_TP', 'MOVE_BOTH'):
                     new_tp_ai = ai_dec.get('new_tp')
                     if new_tp_ai and isinstance(new_tp_ai, (int, float)):
-                        if dirp == 'long' and new_tp_ai > state['position'].get('tp', 0):
-                            log.info(f'AI MOVE TP: {state["position"]["tp"]} → {new_tp_ai}')
+                        cur_tp = state['position'].get('tp', 0)
+                        valid = (dirp=='long' and new_tp_ai > cur_tp) or (dirp=='short' and new_tp_ai < cur_tp)
+                        if valid:
+                            log.info(f'AI MOVE TP: {cur_tp} → {new_tp_ai}')
                             state['position']['tp'] = new_tp_ai
-                        elif dirp == 'short' and new_tp_ai < state['position'].get('tp', 999999):
-                            log.info(f'AI MOVE TP: {state["position"]["tp"]} → {new_tp_ai}')
-                            state['position']['tp'] = new_tp_ai
+                            # Mettre à jour TP sur Bitget
+                            try:
+                                hold_side = dirp
+                                existing = GET('/api/v2/mix/order/plan-delegateList', {
+                                    'symbol': sym, 'productType': 'USDT-FUTURES', 'planType': 'profit_plan', 'status': 'live'
+                                })
+                                for order in (existing.get('data', {}).get('entrustedList') or []):
+                                    oid = order.get('orderId', '')
+                                    if oid:
+                                        POST('/api/v2/mix/order/cancel-plan-order', {
+                                            'symbol': sym, 'productType': 'USDT-FUTURES', 'orderId': oid
+                                        })
+                                        time.sleep(0.15)
+                                sz = state['position'].get('totalSize', 0)
+                                price_dec = len(str(new_tp_ai).split('.')[-1]) if '.' in str(new_tp_ai) else 0
+                                tp_r = POST('/api/v2/mix/order/place-tpsl-order', {
+                                    'symbol':       sym,
+                                    'productType':  'USDT-FUTURES',
+                                    'marginCoin':   'USDT',
+                                    'planType':     'profit_plan',
+                                    'triggerPrice': str(round(new_tp_ai, price_dec)),
+                                    'triggerType':  'mark_price',
+                                    'holdSide':     hold_side,
+                                    'size':         str(sz),
+                                })
+                                log.info(f'AI TP updated on Bitget: code={tp_r.get("code")} msg={tp_r.get("msg","")}')
+                            except Exception as e:
+                                log.warning(f'AI TP Bitget update failed: {e}')
 
             except Exception as e:
                 log.warning(f'AI manage failed: {e}')
