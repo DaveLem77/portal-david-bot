@@ -1597,10 +1597,7 @@ def scan(state):
 
     # Warmup — attendre 6 scans (3 min) avant de trader après un redémarrage
     # Évite d'ouvrir un trade immédiatement sur données insuffisantes
-    if state['_scan_count'] < 2 and not state.get('position'):
-        state['status'] = f'Warmup… ({state["_scan_count"]}/2 scans)'
-        log.info(f'Warmup scan {state["_scan_count"]}/2 — pas de trade encore')
-        return state
+    # Warmup supprimé — trading immédiat après redémarrage
     today = str(datetime.now(timezone.utc).date())
     if state.get('today_date') != today:
         state['today_pnl'] = 0.0
