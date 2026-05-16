@@ -1678,7 +1678,7 @@ def scan(state):
         state['status'] = 'Erreur API marché'
         return state
 
-    # Top 30 par volume
+    candidates = []
     # Top 12 par volume — scan rapide pour Render gratuit
     top = sorted(tickers, key=lambda x: float(x.get('usdtVolume', 0)), reverse=True)[:12]
     weights = state.get('score_weights', {
