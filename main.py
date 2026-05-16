@@ -747,7 +747,7 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
 
         # 7. FUNDING RATE
         try:
-            fund = get_funding(sym)
+            fund = 0.0  # Skip pour vitesse — appel API lent
             if isinstance(fund, (int, float)):
                 if fund < -0.03: long_pts+=12; reasons_long.append(f'Funding {fund:.3f}%')
                 elif fund < -0.01: long_pts+=6
@@ -757,7 +757,7 @@ def score_token(ticker, c1m, c5m, c15m, c1h, weights, c4h=None):
 
         # 8. ORDER BOOK
         try:
-            imbalance = get_orderbook_imbalance(sym)
+            imbalance = 1.0  # Skip pour vitesse — appel API lent
             if isinstance(imbalance, (int, float)):
                 if imbalance > 2.5: long_pts+=15; reasons_long.append(f'Carnet {imbalance:.1f}x acheteurs')
                 elif imbalance > 1.6: long_pts+=8
@@ -1679,8 +1679,8 @@ def scan(state):
         return state
 
     # Top 30 par volume
-    top = sorted(tickers, key=lambda x: float(x.get('usdtVolume', 0)), reverse=True)[:30]
-    candidates = []
+    # Top 12 par volume — scan rapide pour Render gratuit
+    top = sorted(tickers, key=lambda x: float(x.get('usdtVolume', 0)), reverse=True)[:12]
     weights = state.get('score_weights', {
         'rsi':1.0,'macd':1.0,'volume':1.0,'breakout':1.0,'range':1.0,'funding':1.0
     })
@@ -1692,11 +1692,11 @@ def scan(state):
 
         state['signals_checked'] = state.get('signals_checked', 0) + 1
 
-        c1m  = get_candles(sym, '1m', 60); time.sleep(0.03)
-        c5m  = get_candles(sym, '5m', 60); time.sleep(0.03)
-        c15m = get_candles(sym, '15m', 40); time.sleep(0.03)
+        c1m  = get_candles(sym, '1m', 40); time.sleep(0.02)
+        c5m  = get_candles(sym, '5m', 40); time.sleep(0.02)
+        c15m = get_candles(sym, '15m', 30); time.sleep(0.02)
         c1h  = get_candles(sym, '1H', 50);  time.sleep(0.03)
-        c4h  = get_candles(sym, '4H', 30);  time.sleep(0.02)
+        c4h  = []  # Désactivé pour vitesse — filtre EMA utilise c1h
         res = score_token(tk, c1m, c5m, c15m, c1h, weights, c4h)
         if res and res['score'] >= MIN_SCORE:
             candidates.append({'symbol': sym, **res})
