@@ -1253,7 +1253,17 @@ def check_position(state):
                 rsi_now = [round(rsi(closes),1), round(rsi(closes[::5]),1), round(rsi(closes[::15] if len(closes)>=15 else closes),1)]
                 macd_now = round(macd_hist(closes) if closes else 0, 6)
 
-                ai_dec = ai_trade_decision(state, c1m_ai, rsi_now, macd_now, btc_chg, context='manage')
+                # Appel IA manage avec timeout
+                try:
+                    with _cf.ThreadPoolExecutor(max_workers=1) as ex2:
+                        fut2 = ex2.submit(ai_trade_decision, state, c1m_ai, rsi_now, macd_now, btc_chg, 'manage')
+                        ai_dec = fut2.result(timeout=12)
+                except _cf.TimeoutError:
+                    log.warning('AI manage timeout — HOLD par défaut')
+                    ai_dec = {'action': 'HOLD', 'reason': 'AI timeout', 'confidence': 50}
+                except Exception as e:
+                    log.warning(f'AI manage error: {e}')
+                    ai_dec = {'action': 'HOLD', 'reason': 'AI error', 'confidence': 50}
                 action = ai_dec.get('action', 'HOLD')
                 reason = ai_dec.get('reason', '')
                 # Stocker immédiatement dans S global pour /api/ai-status
@@ -1745,7 +1755,19 @@ def scan(state):
     rsi_info = [round(best.get('rsi_1m',50),1), round(best.get('rsi_5m',50),1), round(best.get('rsi_15m',50),1)]
     macd_info = round(best.get('macd',0), 6)
 
-    ai_verdict = ai_trade_decision(state, c1m_ai, rsi_info, macd_info, btc_change, context='entry')
+    # Appel IA avec timeout de 15 secondes max
+    import concurrent.futures as _cf
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(ai_trade_decision, state, c1m_ai, rsi_info, macd_info, btc_change, 'entry')
+            ai_verdict = fut.result(timeout=15)
+    except _cf.TimeoutError:
+        log.warning('AI entry timeout — trade annulé')
+        state['status'] = f'AI timeout — {best["symbol"]} annulé'
+        return state
+    except Exception as e:
+        log.warning(f'AI entry error: {e}')
+        ai_verdict = {'action': 'SKIP', 'reason': 'AI error', 'confidence': 0}
 
     ai_action = ai_verdict.get('action', 'SKIP')
     ai_conf   = ai_verdict.get('confidence', 0)
