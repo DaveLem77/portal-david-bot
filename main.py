@@ -1312,8 +1312,8 @@ def check_position(state):
                                 # Annuler tous les SL existants
                                 existing = GET('/api/v2/mix/order/plan-delegateList', {
                                     'symbol': sym, 'productType': 'USDT-FUTURES', 'planType': 'loss_plan', 'status': 'live'
-                                })
-                                for order in (existing.get('data', {}).get('entrustedList') or []):
+                                }) or {}
+                                for order in ((existing.get('data') or {}).get('entrustedList') or []):
                                     oid = order.get('orderId', '')
                                     if oid:
                                         POST('/api/v2/mix/order/cancel-plan-order', {
@@ -1333,7 +1333,7 @@ def check_position(state):
                                     'holdSide':     hold_side,
                                     'size':         str(sz),
                                 })
-                                log.info(f'AI SL updated on Bitget: code={sl_r.get("code")} msg={sl_r.get("msg","")}')
+                                log.info(f'AI SL updated on Bitget: code={sl_r.get("code") if sl_r else "None"}')
                             except Exception as e:
                                 log.warning(f'AI SL Bitget update failed: {e}')
 
@@ -1350,8 +1350,8 @@ def check_position(state):
                                 hold_side = dirp
                                 existing = GET('/api/v2/mix/order/plan-delegateList', {
                                     'symbol': sym, 'productType': 'USDT-FUTURES', 'planType': 'profit_plan', 'status': 'live'
-                                })
-                                for order in (existing.get('data', {}).get('entrustedList') or []):
+                                }) or {}
+                                for order in ((existing.get('data') or {}).get('entrustedList') or []):
                                     oid = order.get('orderId', '')
                                     if oid:
                                         POST('/api/v2/mix/order/cancel-plan-order', {
@@ -1370,7 +1370,7 @@ def check_position(state):
                                     'holdSide':     hold_side,
                                     'size':         str(sz),
                                 })
-                                log.info(f'AI TP updated on Bitget: code={tp_r.get("code")} msg={tp_r.get("msg","")}')
+                                log.info(f'AI TP updated on Bitget: code={tp_r.get("code") if tp_r else "None"}')
                             except Exception as e:
                                 log.warning(f'AI TP Bitget update failed: {e}')
 
@@ -1762,12 +1762,8 @@ def scan(state):
 
     if ai_action != 'ENTER':
         log.info(f'AI REJECTED: {ai_reason} (conf={ai_conf})')
-        # Score >= 88 avec conf < 78 → override l'IA — algo très confiant
-        if best['score'] >= 88 and ai_conf < 78:
-            log.info(f'OVERRIDE AI: score={best["score"]} >= 88 et conf={ai_conf} < 78 — entrée forcée')
-        else:
-            state['status'] = f'AI a refusé {best["symbol"]}: {ai_reason[:60]}'
-            return state
+        state['status'] = f'AI a refusé {best["symbol"]}: {ai_reason[:60]}'
+        return state
 
     if ai_conf < 70:
         log.info(f'AI confiance trop faible: {ai_conf}% — trade annulé')
